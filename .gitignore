@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+venv/
+.env
+.env.*
+.venv/
+
+# Editor/IDE
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Logs and runtime
+stutter_logs/
+*.log
+pip-wheel-metadata/
+
+# Distribution/build
+build/
+dist/
+*.egg-info/
+
+# OS files
+.DS_Store
+Thumbs.db
