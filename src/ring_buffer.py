@@ -187,3 +187,6 @@ class SyncRingBuffer:
         if reader.read_pos is None:
             return 0
         return max(0, self.write_pos - reader.read_pos)
+    
+    def get_stutter_count(self, name: str) -> int:
+        return self._stutter_counters.get(name, 0)
