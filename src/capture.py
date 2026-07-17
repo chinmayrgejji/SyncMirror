@@ -13,7 +13,7 @@ from ring_buffer import SyncRingBuffer
 
 
 class LoopbackCapture:
-    def __init__(self, samplerate: int | None = None, channels: int = 2, frames_per_buffer: int = 1024):
+    def __init__(self, samplerate: int | None = None, channels: int = 2, frames_per_buffer: int = 512):
         self.samplerate = samplerate
         self.channels = channels
         self.frames_per_buffer = frames_per_buffer

@@ -24,7 +24,7 @@ class DeviceOutput:
         self._stream = None
         self.output_rate = int(device_info.get("defaultSampleRate", ring_buffer.samplerate))
         self.input_rate = ring_buffer.samplerate
-        self.frames_per_buffer = 2048
+        self.frames_per_buffer = 512
 
         base_frames = int((base_safety_ms / 1000.0) * ring_buffer.samplerate)
         user_frames = int((user_delay_ms / 1000.0) * ring_buffer.samplerate)
