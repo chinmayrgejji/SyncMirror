@@ -34,6 +34,9 @@ Windows.
 - **Now-playing panel** — track title/artist, album artwork, a live progress
   bar, and media transport controls (play/pause, next, previous) via the
   Windows GlobalSystemMediaTransportControls API.
+- **Live audio visualizer** — an FFT-driven equalizer rendered behind the album
+  art (blurred artwork backdrop → reactive spectrum bars → sharp thumbnail), with
+  the bars automatically tinted to match the current cover's color palette.
 - **Consistent output quality** across all devices through WASAPI shared mode.
 - Per-device stutter logging to `stutter_logs/` for diagnosing sync issues.
 
