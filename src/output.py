@@ -8,16 +8,41 @@ audio from the shared SyncRingBuffer at its own, independently-tunable
 delay offset.
 """
 
+import time
+
 import numpy as np
 import pyaudiowpatch as pyaudio
 
 from ring_buffer import SyncRingBuffer, ReaderState
 
 
+# How long an output callback may go silent before we treat the stream as dead.
+# A healthy shared-mode stream fires its callback every few ms; a dropped device
+# (e.g. a Bluetooth earbud) stalls it, so this catches disconnects fast without
+# waiting for the periodic hardware rescan.
+CALLBACK_STALL_TIMEOUT_S = 0.5
+
+# When a Bluetooth device physically drops, Windows keeps its endpoint "Active"
+# for several seconds. During that grace window there's no real device left to
+# rate-limit rendering, so PortAudio calls the callback in a tight loop far above
+# its normal cadence. If the measured callback rate exceeds this multiple of the
+# expected (healthy) rate, we treat the stream as dead. This is the signal that
+# catches a dropped BT earbud before the ~10s hardware-enumeration timeout, which
+# matters because the spin starves the *other*, still-connected device.
+CALLBACK_SPIN_RATE_MULTIPLIER = 3.0
+
+
 class DeviceOutput:
-    def __init__(self, pa: pyaudio.PyAudio, device_info: dict, ring_buffer: SyncRingBuffer,
+    def __init__(self, device_name: str, device_info: dict, ring_buffer: SyncRingBuffer,
                  base_safety_ms: float = 150.0, user_delay_ms: float = 0.0, volume: float = 1.0):
-        self.pa = pa
+        # Each DeviceOutput owns its own PyAudio instance (created in start(), below)
+        # rather than sharing one across all devices. PortAudio snapshots the device
+        # list once per PyAudio() instance, so a private, freshly-created instance
+        # guarantees this stream resolves the device as it currently exists -- and
+        # means plugging/unplugging *other* devices can never disturb a stream that's
+        # already running.
+        self.device_name = device_name
+        self.pa = None
         self.device_info = device_info
         self.ring_buffer = ring_buffer
         self.reader = ReaderState(name=device_info["name"])
@@ -25,6 +50,16 @@ class DeviceOutput:
         self.output_rate = int(device_info.get("defaultSampleRate", ring_buffer.samplerate))
         self.input_rate = ring_buffer.samplerate
         self.frames_per_buffer = 512
+        self._last_callback_ts = 0.0
+        self._cb_count = 0
+        self._last_frame_count = self.frames_per_buffer
+        self._health_last_ts = 0.0
+        self._health_last_count = 0
+        # Set True the instant the callback aborts itself (dropped device).
+        self._dead = False
+        # Rolling window used *inside* the callback to detect a spin and self-abort.
+        self._spin_window_start = 0.0
+        self._spin_window_count = 0
 
         base_frames = int((base_safety_ms / 1000.0) * ring_buffer.samplerate)
         user_frames = int((user_delay_ms / 1000.0) * ring_buffer.samplerate)
@@ -41,6 +76,45 @@ class DeviceOutput:
 
     def set_volume(self, volume: float):
         self.reader.set_volume(volume)
+
+    def is_alive(self) -> bool:
+        """True while the output stream is still genuinely playing to a real device.
+
+        A dropped Bluetooth device does NOT flip is_active() to False, nor does its
+        callback simply stall -- during Windows' multi-second endpoint grace period
+        PortAudio keeps the stream 'active' and calls the callback in a tight spin
+        loop (nothing physical left to pace it). That spin is what stutters the
+        other, still-connected device. We detect the death three ways:
+          1. is_active() went False (device cleanly invalidated), or
+          2. the callback stalled (no calls for CALLBACK_STALL_TIMEOUT_S), or
+          3. the callback is spinning far above its healthy rate.
+        """
+        stream = self._stream
+        if stream is None:
+            return False
+        if self._dead:
+            return False
+        try:
+            if not stream.is_active():
+                return False
+        except Exception:
+            return False
+
+        now = time.monotonic()
+        if now - self._last_callback_ts > CALLBACK_STALL_TIMEOUT_S:
+            return False
+
+        dt = now - self._health_last_ts
+        if dt >= 0.15:
+            dcount = self._cb_count - self._health_last_count
+            self._health_last_ts = now
+            self._health_last_count = self._cb_count
+            frame_count = max(1, self._last_frame_count)
+            expected_rate = self.output_rate / frame_count  # callbacks/sec when healthy
+            actual_rate = dcount / dt
+            if actual_rate > expected_rate * CALLBACK_SPIN_RATE_MULTIPLIER:
+                return False
+        return True
 
     def _needed_source_frames(self, output_frame_count: int) -> int:
         ratio = self.input_rate / self.output_rate
@@ -72,10 +146,63 @@ class DeviceOutput:
 
     # -------------------------------------------------------------------
 
+    def _resolve_device_index(self):
+        """Look up this device's *current* PortAudio index by name.
+
+        The index cached on self.device_info may be stale (e.g. it was read from a
+        device list scan taken a moment ago, and another device has since been
+        plugged in or unplugged, shifting indices around). Resolving fresh, against
+        the PyAudio instance we're about to open the stream on, guarantees we open
+        the right hardware.
+        """
+        wasapi_info = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        for i in range(self.pa.get_device_count()):
+            info = self.pa.get_device_info_by_index(i)
+            if (info.get("hostApi") == wasapi_info["index"]
+                    and info["maxOutputChannels"] > 0
+                    and info["name"] == self.device_name):
+                return i
+        raise RuntimeError(f"Device '{self.device_name}' is no longer available.")
+
     def start(self):
         channels = self.ring_buffer.channels
+        self.pa = pyaudio.PyAudio()
+        now = time.monotonic()
+        self._last_callback_ts = now
+        self._health_last_ts = now
+        self._health_last_count = 0
+        self._cb_count = 0
+        self._dead = False
+        self._spin_window_start = now
+        self._spin_window_count = 0
 
         def callback(in_data, frame_count, time_info, status):
+            now = time.monotonic()
+            self._last_callback_ts = now
+            self._cb_count += 1
+            self._last_frame_count = frame_count
+
+            # --- self-abort on spin --------------------------------------
+            # A dropped Bluetooth device isn't paced by any hardware anymore, so
+            # PortAudio calls this callback back-to-back in a tight loop, pegging a
+            # CPU core and (because every output stream shares one in-process
+            # PortAudio host) starving the other, still-connected device. Detect
+            # that spin here and return paAbort, which makes PortAudio stop calling
+            # us *immediately* -- far faster, and without the blocking drain, than
+            # tearing the stream down from the UI thread.
+            self._spin_window_count += 1
+            win = now - self._spin_window_start
+            if win >= 0.05:
+                expected_rate = self.output_rate / max(1, frame_count)  # cb/sec healthy
+                actual_rate = self._spin_window_count / win
+                self._spin_window_start = now
+                self._spin_window_count = 0
+                if actual_rate > expected_rate * CALLBACK_SPIN_RATE_MULTIPLIER:
+                    self._dead = True
+                    silence = np.zeros((frame_count, channels), dtype=np.float32)
+                    return (silence.tobytes(), pyaudio.paAbort)
+            # -------------------------------------------------------------
+
             source_frames = self._needed_source_frames(frame_count)
             source = self.ring_buffer.read(self.reader, source_frames)
             out = self._resample(source, frame_count)
@@ -85,19 +212,50 @@ class DeviceOutput:
                 out *= volume
             return (out.tobytes(), pyaudio.paContinue)
 
-        self._stream = self.pa.open(
-            format=pyaudio.paFloat32,
-            channels=channels,
-            rate=self.output_rate,
-            output=True,
-            output_device_index=self.device_info["index"],
-            frames_per_buffer=self.frames_per_buffer,
-            stream_callback=callback,
-        )
-        self._stream.start_stream()
+        try:
+            device_index = self._resolve_device_index()
+            self._stream = self.pa.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=self.output_rate,
+                output=True,
+                output_device_index=device_index,
+                frames_per_buffer=self.frames_per_buffer,
+                stream_callback=callback,
+            )
+            self._stream.start_stream()
+        except Exception:
+            # Opening failed (e.g. the device isn't visible to this process's
+            # PortAudio yet). Tear the PyAudio instance back down so it doesn't pin
+            # PortAudio's init refcount above 0 -- otherwise a later engine rebuild
+            # could never reach 0 and re-scan hardware to pick this device up.
+            if self._stream is not None:
+                try:
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+            self.pa.terminate()
+            self.pa = None
+            raise
 
     def stop(self):
         if self._stream is not None:
-            self._stream.stop_stream()
-            self._stream.close()
+            # The stream may already be stopped (the callback self-aborted on a
+            # dropped device), in which case stop_stream() raises -- ignore it and
+            # go straight to close().
+            try:
+                self._stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                self._stream.close()
+            except Exception:
+                pass
             self._stream = None
+        if self.pa is not None:
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
+            self.pa = None

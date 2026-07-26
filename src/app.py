@@ -235,6 +235,7 @@ Run with:  python app.py
 
 import asyncio
 import ctypes
+from datetime import datetime, timezone
 from io import BytesIO
 import queue
 import tkinter as tk
@@ -360,6 +361,7 @@ class MediaController:
             status = str(getattr(playback, "playback_status", "")).split(".")[-1]
             timeline = session.get_timeline_properties()
             art_key = (source, title, artist, album)
+            last_updated = getattr(timeline, "last_updated_time", None)
             if include_thumbnail and art_key != self._thumbnail_key:
                 self._thumbnail_key = art_key
                 try:
@@ -374,6 +376,7 @@ class MediaController:
                 "status": status,
                 "position": getattr(timeline, "position", None),
                 "duration": getattr(timeline, "end_time", None),
+                "last_updated": last_updated,
                 "art_key": art_key,
                 "thumbnail": self._thumbnail_bytes if include_thumbnail else None,
             }
@@ -460,12 +463,12 @@ class DeviceCard(ctk.CTkFrame):
         self.stutter_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 10))
 
     def _toggled(self):
-        self.on_toggle(self.info["index"], self.enabled_var.get())
+        self.on_toggle(self.info["name"], self.enabled_var.get())
 
     def _delay_changed(self, value):
         value = float(value)
         self.delay_label.configure(text=f"{int(value)} ms")
-        self.on_delay_change(self.info["index"], value)
+        self.on_delay_change(self.info["name"], value)
 
     def _nudge(self, delta):
         new_val = max(DELAY_MIN, min(DELAY_MAX, self.delay_var.get() + delta))
@@ -500,6 +503,84 @@ class DeviceCard(ctk.CTkFrame):
             self.stutter_label.configure(text="✓ clean", text_color=GOOD)
 
 
+class AudioEndpointWatcher:
+    """Fires the instant an audio render endpoint is disabled/removed by Windows.
+
+    Waiting for a dropped device's audio *callback* to spin or stall (our previous
+    approach) is slow: Windows keeps the endpoint nominally alive for a while after
+    a Bluetooth device physically disconnects, so there's a multi-second lag before
+    we notice. The OS itself knows far sooner -- a WinRT DeviceWatcher built on the
+    audio-render selector (which only matches *enabled* interfaces) fires `Removed`
+    almost immediately when the endpoint is disabled. We record the friendly name of
+    anything removed; the UI loop drains those names and tears the matching output
+    down at once.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._id_to_name = {}        # device interface id -> friendly name
+        self._removed_names = set()  # friendly names removed since last drain
+        self._watcher = None
+
+    def start(self):
+        try:
+            from winrt.windows.devices.enumeration import DeviceWatcher, DeviceInformation
+            from winrt.windows.media.devices import MediaDevice
+
+            selector = MediaDevice.get_audio_render_selector()
+            watcher = DeviceInformation.create_watcher_aqs_filter(selector)
+            watcher.add_added(self._on_added)
+            watcher.add_updated(self._on_updated)
+            watcher.add_removed(self._on_removed)
+            watcher.start()
+            self._watcher = watcher
+        except Exception as exc:
+            # If the watcher can't be created we simply fall back to the callback
+            # spin/stall detection -- slower, but still functional.
+            print(f"[SyncMirror] AudioEndpointWatcher unavailable: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
+            self._watcher = None
+
+    def stop(self):
+        if self._watcher is not None:
+            try:
+                self._watcher.stop()
+            except Exception:
+                pass
+            self._watcher = None
+
+    def _on_added(self, sender, info):
+        try:
+            with self._lock:
+                self._id_to_name[info.id] = info.name
+        except Exception:
+            pass
+
+    def _on_updated(self, sender, update):
+        # Keep the id->name map warm; updates don't carry the name reliably.
+        pass
+
+    def _on_removed(self, sender, update):
+        try:
+            with self._lock:
+                name = self._id_to_name.pop(update.id, None)
+                if name:
+                    self._removed_names.add(name)
+                    print(f"[SyncMirror] Endpoint watcher: '{name}' removed by OS.",
+                          flush=True)
+        except Exception:
+            pass
+
+    def drain_removed(self):
+        """Return (and clear) the set of friendly names removed since last call."""
+        with self._lock:
+            if not self._removed_names:
+                return frozenset()
+            names = frozenset(self._removed_names)
+            self._removed_names.clear()
+            return names
+
+
 class App:
     def __init__(self, root: ctk.CTk):
         self.root = root
@@ -508,14 +589,18 @@ class App:
         self.root.minsize(1080, 650)
         self.root.configure(fg_color=BG)
 
-        self.pa = pyaudio.PyAudio()
         self.ring_buffer = None
         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
         self.media = MediaController()
 
-        self.cards = {}            # device_index -> DeviceCard
-        self.device_outputs = {}   # device_index -> DeviceOutput
+        self.endpoint_watcher = AudioEndpointWatcher()
+        self.endpoint_watcher.start()
+
+        self.cards = {}            # device name -> DeviceCard
+        self.device_outputs = {}   # device name -> DeviceOutput
         self.running = False
+        self._device_scan_results = queue.Queue()
+        self._device_scan_running = False
         self.source_delay = tk.DoubleVar(value=0.0)
         self._updating = False
         self._buffer_low_seen = False
@@ -540,6 +625,8 @@ class App:
 
         self._build_ui()
         self._populate_devices()
+        self.root.after(500, self._poll_device_scan_results)
+        self.root.after(1500, self._auto_rescan)
         self._update_track_metadata()
         self._poll_artwork_results()
         self._poll_metadata_results()
@@ -713,23 +800,121 @@ class App:
         self.devices_frame.pack(fill="both", expand=True)
 
     def _populate_devices(self):
-        """Scan for output devices and add new ones to the list."""
+        """Trigger a device scan. Runs off the UI thread since re-enumerating WASAPI
+        hardware (needed to see newly plugged/unplugged devices) can take a beat."""
+        if self._device_scan_running:
+            return
+        self._device_scan_running = True
+        threading.Thread(target=self._scan_devices_worker, daemon=True).start()
+
+    def _auto_rescan(self):
+        """Periodically re-scan for hardware changes so devices appear/disappear on
+        their own, without the user pressing 'Refresh Devices'. Kept short so a
+        dropped device (and its dead output stream) is torn down quickly."""
+        self._populate_devices()
+        self.root.after(1500, self._auto_rescan)
+
+    def _scan_devices_worker(self):
         try:
             devices = self.capture.list_output_devices()
-            for info in devices:
-                if info["index"] not in self.cards:
-                    card = DeviceCard(self.devices_frame, info,
-                                     on_toggle=self._on_toggle, on_delay_change=self._on_delay_change)
-                    card.pack(fill="x", pady=6)
-                    self.cards[info["index"]] = card
         except Exception:
-            pass  # silently ignore enumeration errors
+            devices = None
+        self._device_scan_results.put(devices)
+
+    def _poll_device_scan_results(self):
+        try:
+            while True:
+                devices = self._device_scan_results.get_nowait()
+                self._device_scan_running = False
+                if devices is not None:
+                    self._apply_device_scan(devices)
+        except queue.Empty:
+            pass
+        self.root.after(500, self._poll_device_scan_results)
+
+    def _apply_device_scan(self, devices):
+        """Reconcile the on-screen device cards with what's currently attached:
+        add cards for newly-seen devices, and remove cards (stopping any active
+        output first) for devices that were unplugged/disabled."""
+        current_names = set()
+        for info in devices:
+            name = info["name"]
+            current_names.add(name)
+            if name in self.cards:
+                # device is still here -- keep the existing widget/settings, just
+                # refresh the cached info (its numeric index may have shifted)
+                self.cards[name].info = info
+            else:
+                card = DeviceCard(self.devices_frame, info,
+                                 on_toggle=self._on_toggle, on_delay_change=self._on_delay_change)
+                card.pack(fill="x", pady=6)
+                self.cards[name] = card
+
+        for name in list(self.cards.keys()):
+            if name not in current_names:
+                out = self.device_outputs.pop(name, None)
+                if out:
+                    out.stop()
+                self.cards[name].destroy()
+                del self.cards[name]
+
+        if self.running:
+            self.status_label.configure(
+                text=f"Running — {len(self.device_outputs)} device(s)", text_color="white"
+            )
 
     # --------------------------------------------------------- live loop --
 
     def _update_live_stats(self):
         if not self._updating:
             return
+
+        # Fast-path removal of dead outputs: if a device dropped (e.g. a Bluetooth
+        # earbud disconnected), its stream is invalidated by WASAPI. Leaving it in
+        # place lets the dead stream keep pulling on the shared audio engine, which
+        # stutters the still-connected devices, so we tear it down immediately.
+        #
+        # Two detectors feed this:
+        #   1. The OS endpoint watcher (fastest) -- Windows tells us the moment an
+        #      audio endpoint is disabled, well before the stream misbehaves.
+        #   2. is_alive() -- a fallback that notices the callback spinning/stalling
+        #      if the watcher ever misses an event.
+        removed_by_os = self.endpoint_watcher.drain_removed()
+
+        def _matches_removed(out_name: str) -> bool:
+            for r in removed_by_os:
+                if r == out_name or r in out_name or out_name in r:
+                    return True
+            return False
+
+        dropped = [
+            name for name, out in self.device_outputs.items()
+            if _matches_removed(name) or not out.is_alive()
+        ]
+        for name in dropped:
+            print(f"[SyncMirror] Output '{name}' looks dead (disconnected) -> stopping it.", flush=True)
+            out = self.device_outputs.pop(name, None)
+            if out:
+                # Tear the dead stream down on a background thread. Closing a dropped
+                # Bluetooth stream can block for seconds while WASAPI/PortAudio drains
+                # or times out the invalid endpoint -- and it holds PortAudio's global
+                # lock while it does. Running it inline here would freeze the UI *and*
+                # starve the still-connected device for exactly as long as the drop was
+                # already stuttering it. The callback has already self-aborted, so the
+                # stream is silent; we just need close()/terminate() off the UI thread.
+                threading.Thread(target=out.stop, name=f"teardown-{name}", daemon=True).start()
+            card = self.cards.get(name)
+            if card is not None:
+                card.enabled_var.set(False)
+                card.update_live_stats(0, 0, active=False)
+        if dropped:
+            # Kick a rescan so the card for the removed device disappears promptly too.
+            self._populate_devices()
+            if self.running:
+                self.status_label.configure(
+                    text=f"Running — {len(self.device_outputs)} device(s)", text_color="white"
+                )
+
         lowest_buffer_ms = None
         for idx, card in list(self.cards.items()):
             out = self.device_outputs.get(idx)
@@ -745,7 +930,7 @@ class App:
         if lowest_buffer_ms is not None:
             self._check_auto_reset_condition(lowest_buffer_ms)
 
-        self.root.after(200, self._update_live_stats)
+        self.root.after(100, self._update_live_stats)
 
     # --------------------------------------------------------- actions --
 
@@ -755,6 +940,15 @@ class App:
             messagebox.showwarning("No devices selected", "Turn on at least one output device to mirror to.")
             return
 
+        # Recreate capture from scratch so this process's PortAudio is torn down to
+        # a 0 refcount and re-initialised. That re-enumeration is what lets us open
+        # streams on devices that were plugged in *after* the app launched.
+        try:
+            self.capture.close()
+        except Exception:
+            pass
+        self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
+
         try:
             samplerate = self.capture.prepare()
             self.ring_buffer = SyncRingBuffer(RING_BUFFER_SECONDS, CHANNELS, samplerate)
@@ -763,16 +957,21 @@ class App:
             messagebox.showerror("Capture error", str(e))
             return
 
+        failed = []
         for idx in selected:
             card = self.cards[idx]
-            out = DeviceOutput(
-                self.pa, card.info, self.ring_buffer,
-                base_safety_ms=BASE_SAFETY_MS,
-                user_delay_ms=card.delay_var.get() + self.source_delay.get(),
-                volume=1.0,
-            )
-            out.start()
-            self.device_outputs[idx] = out
+            try:
+                out = DeviceOutput(
+                    card.info["name"], card.info, self.ring_buffer,
+                    base_safety_ms=BASE_SAFETY_MS,
+                    user_delay_ms=card.delay_var.get() + self.source_delay.get(),
+                    volume=1.0,
+                )
+                out.start()
+                self.device_outputs[idx] = out
+            except Exception:
+                failed.append(card.info["name"])
+                card.enabled_var.set(False)
 
         self.running = True
         self.status_dot.configure(text_color=GOOD)
@@ -784,6 +983,12 @@ class App:
 
         self._updating = True
         self._update_live_stats()
+
+        if failed:
+            messagebox.showwarning(
+                "Device unavailable",
+                "Could not start these device(s):\n" + "\n".join(failed),
+            )
 
     def stop_sync(self):
         for out in self.device_outputs.values():
@@ -813,18 +1018,81 @@ class App:
         if enabled:
             if device_index in self.device_outputs:
                 return
-            out = DeviceOutput(
-                self.pa, card.info, self.ring_buffer,
-                base_safety_ms=BASE_SAFETY_MS,
-                user_delay_ms=card.delay_var.get() + self.source_delay.get(),
-                volume=1.0,
-            )
-            out.start()
-            self.device_outputs[device_index] = out
+            try:
+                out = DeviceOutput(
+                    card.info["name"], card.info, self.ring_buffer,
+                    base_safety_ms=BASE_SAFETY_MS,
+                    user_delay_ms=card.delay_var.get() + self.source_delay.get(),
+                    volume=1.0,
+                )
+                out.start()
+                self.device_outputs[device_index] = out
+            except Exception:
+                # Device was almost certainly connected after the app launched, so
+                # this process's PortAudio doesn't know about it yet. Rebuild the
+                # whole engine (forcing a fresh hardware scan) so it becomes usable.
+                self._rebuild_audio_engine()
         else:
             out = self.device_outputs.pop(device_index, None)
             if out:
                 out.stop()
+
+    def _rebuild_audio_engine(self):
+        """Tear PortAudio fully down (every PyAudio instance in this process) so the
+        next Pa_Initialize() re-enumerates hardware, then restart capture and every
+        enabled output. This is what allows a device connected *after* app launch to
+        be mirrored. Causes a brief (sub-second) audio gap on the other devices."""
+        if not self.running:
+            return
+
+        delays = {name: card.delay_var.get() for name, card in self.cards.items()}
+        enabled = [name for name, card in self.cards.items() if card.enabled_var.get()]
+
+        # tear everything down -> PortAudio refcount reaches 0
+        for out in self.device_outputs.values():
+            out.stop()
+        self.device_outputs.clear()
+        try:
+            self.capture.close()
+        except Exception:
+            pass
+
+        # fresh instance -> next Pa_Initialize() is a genuine 0 -> 1 hardware scan
+        self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
+        try:
+            samplerate = self.capture.prepare()
+            self.ring_buffer = SyncRingBuffer(RING_BUFFER_SECONDS, CHANNELS, samplerate)
+            self.capture.start(self.ring_buffer)
+        except Exception as e:
+            messagebox.showerror("Capture error", str(e))
+            self.stop_sync()
+            return
+
+        failed = []
+        for name in enabled:
+            card = self.cards.get(name)
+            if card is None:
+                continue
+            try:
+                out = DeviceOutput(
+                    name, card.info, self.ring_buffer,
+                    base_safety_ms=BASE_SAFETY_MS,
+                    user_delay_ms=delays.get(name, 0.0) + self.source_delay.get(),
+                    volume=1.0,
+                )
+                out.start()
+                self.device_outputs[name] = out
+            except Exception:
+                failed.append(name)
+                card.enabled_var.set(False)
+
+        self.status_label.configure(text=f"Running — {len(self.device_outputs)} device(s)",
+                                     text_color="white")
+        if failed:
+            messagebox.showwarning(
+                "Device unavailable",
+                "Could not start these device(s):\n" + "\n".join(failed),
+            )
 
     def _on_delay_change(self, device_index, value):
         out = self.device_outputs.get(device_index)
@@ -976,6 +1244,27 @@ class App:
         except (AttributeError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _timeline_age(last_updated):
+        """Seconds elapsed since GSMTC last stamped the timeline position.
+
+        `last_updated` is a WinRT DateTime projected as a timezone-aware datetime.
+        Returns 0.0 if it's missing, malformed, or in the future (clock skew)."""
+        if last_updated is None:
+            return 0.0
+        try:
+            now = datetime.now(timezone.utc)
+            if last_updated.tzinfo is None:
+                last_updated = last_updated.replace(tzinfo=timezone.utc)
+            age = (now - last_updated).total_seconds()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return 0.0
+        # Ignore absurd values (e.g. epoch-zero sentinels) that would fling the
+        # clock far past the track; only trust a plausible recent timestamp.
+        if age < 0.0 or age > 24 * 3600:
+            return 0.0
+        return age
+
     def _render_playback_clock(self):
         position = self._timeline_position_seconds
         duration = self._timeline_duration_seconds
@@ -1046,12 +1335,22 @@ class App:
                     and track_key == self._timeline_track_key
                     and self._timeline_position_seconds is not None
                 )
+                # GSMTC reports `position` as of `last_updated`, not "now". If the
+                # track is playing, the real current position is that value plus the
+                # wall-clock time elapsed since. Without this, sessions that were
+                # already playing before the app read them (or apps like Chrome that
+                # stamp position at track start) would wrongly begin the clock at 0.
+                age = self._timeline_age(current.get("last_updated")) if status == "PLAYING" else 0.0
                 # Chrome often returns 0 for timeline.position while playing.
                 # Keep our monotonic local clock for the same track instead of
                 # resetting it to that stale value on every metadata poll.
                 if not same_playing_track:
-                    self._timeline_position_seconds = position_seconds
-                    self._timeline_anchor = time.monotonic()
+                    if position_seconds is not None:
+                        self._timeline_position_seconds = position_seconds
+                        self._timeline_anchor = time.monotonic() - age
+                    else:
+                        self._timeline_position_seconds = position_seconds
+                        self._timeline_anchor = time.monotonic()
                 self._timeline_duration_seconds = duration_seconds or self._timeline_duration_seconds
                 self._timeline_track_key = track_key
                 self._timeline_playing = status == "PLAYING"
@@ -1108,8 +1407,8 @@ class App:
     def on_close(self):
         if self.running:
             self.stop_sync()
+        self.endpoint_watcher.stop()
         self.capture.close()
-        self.pa.terminate()
         self.root.destroy()
 
 

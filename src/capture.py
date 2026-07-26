@@ -6,10 +6,68 @@ into the shared SyncRingBuffer, untouched (no resampling here) so every
 downstream device works from identical source data.
 """
 
+import json
+import subprocess
+import sys
+
 import numpy as np
 import pyaudiowpatch as pyaudio
 
 from ring_buffer import SyncRingBuffer
+
+
+# Enumeration must run in a *separate process*. PortAudio reference-counts
+# Pa_Initialize()/Pa_Terminate() and only scans the system's audio hardware on
+# the transition from 0 -> 1. Because this app keeps a persistent PyAudio
+# instance alive (the live loopback capture), that count never returns to 0, so
+# any PyAudio() created *within this process* just replays the snapshot taken at
+# startup -- it can never see devices plugged in or removed afterwards. A brand
+# new process starts its own count at 0, so its first Pa_Initialize() performs a
+# genuine, fresh hardware scan.
+_ENUMERATE_SCRIPT = r"""
+import json, sys
+import pyaudiowpatch as pyaudio
+
+pa = pyaudio.PyAudio()
+try:
+    wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+    default_name = None
+    try:
+        default_name = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])["name"]
+    except Exception:
+        pass
+    out = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info.get("hostApi") != wasapi["index"] or info["maxOutputChannels"] <= 0:
+            continue
+        if info.get("isLoopbackDevice", False):
+            continue
+        if default_name is not None and info["name"] == default_name:
+            continue
+        out.append(dict(info))
+    sys.stdout.write(json.dumps(out))
+finally:
+    pa.terminate()
+"""
+
+
+def enumerate_output_devices(timeout: float = 6.0):
+    """Return the WASAPI output devices *currently* attached to the system.
+
+    Runs the scan in a short-lived subprocess (see _ENUMERATE_SCRIPT) so PortAudio
+    re-enumerates real hardware every call, instead of replaying a stale snapshot.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _ENUMERATE_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise RuntimeError(proc.stderr.strip() or "device enumeration subprocess failed")
+    return json.loads(proc.stdout)
 
 
 class LoopbackCapture:
@@ -84,20 +142,14 @@ class LoopbackCapture:
         self._pa.terminate()
 
     def list_output_devices(self):
-        """List all WASAPI output devices (candidates for mirrored playback)."""
-        if self._source_output_device_index is None:
-            try:
-                self.get_default_loopback_device()
-            except Exception:
-                pass
+        """List all WASAPI output devices (candidates for mirrored playback).
 
-        devices = []
-        wasapi_info = self._pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-        for i in range(self._pa.get_device_count()):
-            info = self._pa.get_device_info_by_index(i)
-            if info.get("hostApi") != wasapi_info["index"] or info["maxOutputChannels"] <= 0:
-                continue
-            if self._source_output_device_index is not None and info["index"] == self._source_output_device_index:
-                continue
-            devices.append(info)
-        return devices
+        Delegates to enumerate_output_devices(), which runs the scan in a
+        short-lived subprocess. That is the only way to reflect what's *currently*
+        attached: PortAudio only scans hardware on a 0 -> 1 Pa_Initialize()
+        transition, and this process keeps a PyAudio instance alive for the live
+        capture, pinning the count above 0. A fresh subprocess starts at 0, so it
+        always sees newly connected / disconnected devices. Safe to call at any
+        time, including while capture is running.
+        """
+        return enumerate_output_devices()
