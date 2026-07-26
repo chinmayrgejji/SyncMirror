@@ -117,6 +117,27 @@ class SyncRingBuffer:
                 self._buf[: end - self.capacity_frames] = frames[first:]
             self.write_pos += n
 
+    def peek_latest(self, n_frames: int) -> np.ndarray:
+        """Non-destructively return the most recent n_frames as a mono float32
+        array, for visualization. Does not touch any reader cursor."""
+        with self._write_lock:
+            write_pos = self.write_pos
+            if write_pos <= 0 or n_frames <= 0:
+                return np.zeros(0, dtype=np.float32)
+            n = min(n_frames, self.capacity_frames, write_pos)
+            start = (write_pos - n) % self.capacity_frames
+            end = start + n
+            if end <= self.capacity_frames:
+                chunk = self._buf[start:end].copy()
+            else:
+                first = self.capacity_frames - start
+                chunk = np.empty((n, self.channels), dtype=np.float32)
+                chunk[:first] = self._buf[start:]
+                chunk[first:] = self._buf[: end - self.capacity_frames]
+        if chunk.ndim == 2 and chunk.shape[1] > 1:
+            return chunk.mean(axis=1)
+        return chunk.reshape(-1)
+
     # ---------------------------------------------------------- reader --
 
     def set_reader_delay(self, reader: ReaderState, frames: int):

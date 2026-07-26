@@ -247,9 +247,10 @@ import customtkinter as ctk
 import pyaudiowpatch as pyaudio
 
 try:
-    from PIL import Image, ImageFilter, ImageOps, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 except ImportError:
     Image = None
+    ImageDraw = None
     ImageFilter = None
     ImageOps = None
     ImageTk = None
@@ -279,6 +280,11 @@ TEXT_DIM = "#8b93a3"
 ARTWORK_ASPECT_RATIO = 16 / 9
 ARTWORK_WIDTH = 440
 ARTWORK_HEIGHT = round(ARTWORK_WIDTH / ARTWORK_ASPECT_RATIO)
+
+VIS_BARS = 40           # number of synth/equalizer bars
+VIS_INTERVAL_MS = 33    # ~30 fps redraw
+VIS_ATTACK = 0.6        # how fast a bar rises toward a new peak
+VIS_DECAY = 0.15        # how slowly it falls back
 
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
@@ -613,6 +619,11 @@ class App:
         self._artwork_width = ARTWORK_WIDTH
         self._artwork_height = ARTWORK_HEIGHT
         self._artwork_resize_handle = None
+        self._art_bg = None            # cached blurred backdrop (RGB) at current size
+        self._art_fg = None            # cached small sharp thumbnail (RGBA)
+        self._art_fg_offset = (0, 0)
+        self._bar_colors = None        # per-bar RGB colors sampled from the artwork
+        self._vis_levels = [0.0] * VIS_BARS
         self._artwork_results = queue.Queue()
         self._metadata_results = queue.Queue()
         self._metadata_request_running = False
@@ -631,6 +642,8 @@ class App:
         self._poll_artwork_results()
         self._poll_metadata_results()
         self._tick_playback_clock()
+        if Image is not None:
+            self._tick_visualizer()
 
     # ------------------------------------------------------------- UI --
 
@@ -1175,33 +1188,178 @@ class App:
         if thumbnail_bytes == self._artwork_bytes and not force:
             return
         self._artwork_bytes = thumbnail_bytes
-        if not thumbnail_bytes or Image is None or ImageOps is None or ImageTk is None:
-            # Clear the Tk label before releasing the old PhotoImage.  Releasing
-            # it first deletes its Tcl image while the label still refers to it.
-            old_image = self._artwork_image
-            self.artwork_label.configure(image="", text="No artwork")
-            self._artwork_image = None
+        target = (self._artwork_width, self._artwork_height)
+
+        if Image is None or ImageTk is None:
             return
+
+        # No artwork: use a flat dark backdrop so the bars still have a stage.
+        if not thumbnail_bytes:
+            self._art_bg = Image.new("RGB", target, (22, 25, 35))
+            self._art_fg = None
+            self._art_fg_offset = (0, 0)
+            self._bar_colors = None
+            self._composite_artwork()
+            return
+
         try:
             with Image.open(BytesIO(thumbnail_bytes)) as raw_image:
                 artwork = raw_image.convert("RGBA")
                 resampling = getattr(Image, "Resampling", Image).LANCZOS
-                canvas = ImageOps.fit(
-                    artwork,
-                    (self._artwork_width, self._artwork_height),
-                    method=resampling,
-                )
+
+                # Back layer: the album art fitted to the banner, heavily blurred
+                # and dimmed so the synth bars in front stand out.
+                background = ImageOps.fit(artwork, target, method=resampling).convert("RGB")
                 if ImageFilter is not None:
-                    canvas = canvas.filter(ImageFilter.UnsharpMask(radius=1.2, percent=110, threshold=3))
-            # This native Tk label and its image are both created on Tk's main thread.
-            old_image = self._artwork_image
-            new_image = ImageTk.PhotoImage(canvas, master=self.root)
-            self.artwork_label.configure(image=new_image, text="")
-            self._artwork_image = new_image
+                    background = background.filter(ImageFilter.GaussianBlur(radius=18))
+                    background = background.point(lambda p: int(p * 0.7))
+                self._art_bg = background
+
+                # Front layer: the thumbnail kept SMALL (native size, never upscaled).
+                foreground = artwork.copy()
+                foreground.thumbnail(target, resampling)
+                if ImageFilter is not None:
+                    foreground = foreground.filter(
+                        ImageFilter.UnsharpMask(radius=1.2, percent=110, threshold=3)
+                    )
+                self._art_fg = foreground
+                self._art_fg_offset = (
+                    (target[0] - foreground.width) // 2,
+                    (target[1] - foreground.height) // 2,
+                )
+                # Bars take their colors from the album art so the visualizer
+                # matches the thumbnail's palette.
+                self._bar_colors = self._make_bar_colors(self._palette_from_image(artwork))
+            self._composite_artwork()
         except Exception:
-            old_image = self._artwork_image
-            self.artwork_label.configure(image="", text="No artwork")
-            self._artwork_image = None
+            self._art_bg = Image.new("RGB", target, (22, 25, 35))
+            self._art_fg = None
+            self._art_fg_offset = (0, 0)
+            self._bar_colors = None
+            self._composite_artwork()
+
+    def _composite_artwork(self):
+        """Draw the three layers: blurred backdrop -> synth bars -> thumbnail."""
+        if self._art_bg is None or Image is None or ImageTk is None:
+            return
+        w, h = self._art_bg.size
+        frame = self._art_bg.convert("RGBA")
+
+        if ImageDraw is not None:
+            overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(overlay)
+            n = len(self._vis_levels)
+            gap = 3
+            bar_w = max(2.0, (w - gap * (n + 1)) / n)
+            max_h = h * 0.92
+            for i, level in enumerate(self._vis_levels):
+                bar_h = max(2.0, level * max_h)
+                x0 = gap + i * (bar_w + gap)
+                x1 = x0 + bar_w
+                y1 = h
+                y0 = y1 - bar_h
+                alpha = int(90 + 110 * min(1.0, level))  # taller = more opaque
+                if self._bar_colors is not None:
+                    r, g, b = self._bar_colors[i % len(self._bar_colors)]
+                else:
+                    r, g, b = (77, 163, 255)
+                draw.rounded_rectangle([x0, y0, x1, y1], radius=bar_w / 2,
+                                       fill=(r, g, b, alpha))
+            frame = Image.alpha_composite(frame, overlay)
+
+        if self._art_fg is not None:
+            frame.paste(self._art_fg, self._art_fg_offset, self._art_fg)
+
+        new_image = ImageTk.PhotoImage(frame, master=self.root)
+        self.artwork_label.configure(image=new_image, text="")
+        self._artwork_image = new_image
+
+    def _palette_from_image(self, img, n=6):
+        """Extract up to n vibrant RGB colors from the artwork for the bars."""
+        try:
+            rgb = img.convert("RGB")
+            quant = getattr(Image, "Quantize", None)
+            method = quant.MEDIANCUT if quant is not None else None
+            pal_img = rgb.quantize(colors=max(2, n), method=method) if method is not None \
+                else rgb.quantize(colors=max(2, n))
+            palette = pal_img.getpalette() or []
+            counts = pal_img.getcolors() or []  # list of (count, palette_index)
+            colors = []
+            for _cnt, idx in sorted(counts, key=lambda c: c[0], reverse=True):
+                base = idx * 3
+                r, g, b = palette[base:base + 3]
+                # skip near-black and near-white so bars stay colorful
+                if max(r, g, b) < 45 or min(r, g, b) > 235:
+                    continue
+                colors.append((r, g, b))
+            if not colors:
+                # fall back to whatever we have, else accent blue
+                for _cnt, idx in sorted(counts, key=lambda c: c[0], reverse=True):
+                    base = idx * 3
+                    colors.append(tuple(palette[base:base + 3]))
+            return colors or [(77, 163, 255)]
+        except Exception:
+            return [(77, 163, 255)]
+
+    def _make_bar_colors(self, palette):
+        """Spread a palette across VIS_BARS as a smooth left-to-right gradient."""
+        import numpy as np
+        if not palette:
+            return None
+        pal = np.array(palette, dtype=np.float32)
+        pal = np.clip(pal * 1.15, 0, 255)  # brighten a touch so bars pop
+        if len(pal) == 1:
+            row = tuple(int(c) for c in pal[0])
+            return [row] * VIS_BARS
+        xs = np.linspace(0, len(pal) - 1, VIS_BARS)
+        lo = np.floor(xs).astype(int)
+        hi = np.minimum(lo + 1, len(pal) - 1)
+        frac = (xs - lo)[:, None]
+        cols = pal[lo] * (1 - frac) + pal[hi] * frac
+        return [tuple(int(c) for c in row) for row in cols]
+
+    def _spectrum_bands(self, samples):
+        """Turn a mono sample window into VIS_BARS normalized (0..1) band levels."""
+        import numpy as np
+        samples = samples[-2048:]
+        windowed = samples * np.hanning(samples.size)
+        spec = np.abs(np.fft.rfft(windowed))
+        sr = self.ring_buffer.samplerate if self.ring_buffer else SAMPLERATE
+        freqs = np.fft.rfftfreq(samples.size, 1.0 / sr)
+        fmin, fmax = 40.0, min(16000.0, sr / 2)
+        edges = np.logspace(np.log10(fmin), np.log10(fmax), VIS_BARS + 1)
+        # Sample the spectrum at each band's *center* frequency by interpolation.
+        # Averaging only the bins that fall inside a band leaves the lowest bands
+        # empty (at a 2048-sample window the bins are ~23 Hz apart, wider than the
+        # first few log-spaced bands), which made the leftmost bars always flat.
+        centers = np.sqrt(edges[:-1] * edges[1:])
+        bands = np.interp(centers, freqs, spec)
+        bands = np.log1p(bands * 8.0)
+        peak = bands.max()
+        if peak > 1e-6:
+            bands /= peak
+        return np.clip(bands, 0.0, 1.0)
+
+    def _tick_visualizer(self):
+        import numpy as np
+        new = None
+        if self.running and self.ring_buffer is not None:
+            samples = self.ring_buffer.peek_latest(2048)
+            if samples.size >= 128 and float(np.max(np.abs(samples))) > 1e-4:
+                new = self._spectrum_bands(samples)
+        if new is None:
+            # Gentle idle shimmer when nothing is playing.
+            t = time.monotonic()
+            idx = np.arange(VIS_BARS)
+            new = 0.05 + 0.04 * (0.5 + 0.5 * np.sin(t * 2.0 + idx * 0.5))
+
+        for i in range(VIS_BARS):
+            cur = self._vis_levels[i]
+            k = VIS_ATTACK if new[i] > cur else VIS_DECAY
+            self._vis_levels[i] = cur + (float(new[i]) - cur) * k
+
+        self._composite_artwork()
+        self.root.after(VIS_INTERVAL_MS, self._tick_visualizer)
 
     def _request_artwork(self, art_key):
         """Fetch artwork outside Tk's event loop, as some media apps delay the stream."""
