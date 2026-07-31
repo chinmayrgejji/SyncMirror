@@ -55,6 +55,10 @@ class DeviceOutput:
         self._last_frame_count = self.frames_per_buffer
         self._health_last_ts = 0.0
         self._health_last_count = 0
+        # Carries the sub-frame remainder between callbacks so that, on average, we
+        # advance the reader by exactly output_frame_count * (input/output) source
+        # frames -- never the rounded-up amount, which would slowly drain the buffer.
+        self._read_frac = 0.0
         # Set True the instant the callback aborts itself (dropped device).
         self._dead = False
         # Rolling window used *inside* the callback to detect a spin and self-abort.
@@ -120,6 +124,24 @@ class DeviceOutput:
         ratio = self.input_rate / self.output_rate
         return max(1, int(np.ceil(output_frame_count * ratio)) + 2)
 
+    def _plan_read(self, output_frame_count: int) -> tuple[int, int]:
+        """Return (frames_to_read, frames_to_consume) for one output callback.
+
+        `frames_to_consume` is the *exact* number of source frames this callback is
+        entitled to advance the reader by, accumulated fractionally so that over time
+        we advance by precisely output_frame_count * (input/output) -- the physically
+        correct rate the output hardware demands. `frames_to_read` is a hair larger so
+        the resampler has an endpoint sample to interpolate against; those extra frames
+        are peeked but NOT consumed, so they never drain the safety buffer.
+        """
+        ratio = self.input_rate / self.output_rate
+        exact = output_frame_count * ratio + self._read_frac
+        consume = int(exact)
+        self._read_frac = exact - consume
+        consume = max(1, consume)
+        read = consume + 2
+        return read, consume
+
     def _resample(self, frames: np.ndarray, output_frame_count: int) -> np.ndarray:
         if self.input_rate == self.output_rate:
             if frames.shape[0] == output_frame_count:
@@ -175,6 +197,7 @@ class DeviceOutput:
         self._dead = False
         self._spin_window_start = now
         self._spin_window_count = 0
+        self._read_frac = 0.0
 
         def callback(in_data, frame_count, time_info, status):
             now = time.monotonic()
@@ -203,8 +226,8 @@ class DeviceOutput:
                     return (silence.tobytes(), pyaudio.paAbort)
             # -------------------------------------------------------------
 
-            source_frames = self._needed_source_frames(frame_count)
-            source = self.ring_buffer.read(self.reader, source_frames)
+            read_frames, consume_frames = self._plan_read(frame_count)
+            source = self.ring_buffer.read(self.reader, read_frames, consume=consume_frames)
             out = self._resample(source, frame_count)
             with self.reader.lock:
                 volume = self.reader.volume

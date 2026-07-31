@@ -147,11 +147,18 @@ class SyncRingBuffer:
             # Do not reposition the read cursor immediately on live delay changes.
             # The output callback will gently drift the reader to the new target.
 
-    def read(self, reader: ReaderState, n_frames: int) -> np.ndarray:
+    def read(self, reader: ReaderState, n_frames: int, consume: int | None = None) -> np.ndarray:
         """
         Called from an output device's callback. Returns exactly
         n_frames of audio (silence-padded if the buffer hasn't caught up
         yet), applying that device's volume and delay/drift compensation.
+
+        `n_frames` is how many frames to *return* (the caller may peek a few
+        extra to give its resampler an interpolation endpoint). `consume`, if
+        given, is how many frames the reader is actually entitled to advance
+        by this callback -- normally slightly less than `n_frames`. Advancing
+        by `consume` instead of by everything read is what prevents a slow,
+        systematic drain of the safety buffer when the caller peeks ahead.
         """
         with reader.lock:
             reader._update_target_delay()
@@ -244,7 +251,17 @@ class SyncRingBuffer:
                 with reader.lock:
                     reader._consecutive_underruns = 0
 
-        read_pos += to_copy
+        # Advance the cursor by the exact per-callback consumption rate, not by
+        # everything we copied. The caller peeks a couple of extra frames for its
+        # resampler; advancing over those would drain the buffer ~2 frames/callback
+        # (~180 frames/s), collapsing the safety margin to zero within tens of
+        # seconds and producing periodic underrun "pauses". Never advance past what
+        # was actually available (on an underrun to_copy < consume).
+        if consume is None:
+            advance = to_copy
+        else:
+            advance = min(consume, to_copy)
+        read_pos += advance
 
         # --- drift correction: move toward the target delay more aggressively when needed ---
         if abs(drift) > self.max_drift_frames:
