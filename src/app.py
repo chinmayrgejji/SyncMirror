@@ -1,228 +1,3 @@
-# """
-# app.py
-
-# Prototype UI for the multi-device synced audio mirror.
-
-# Run with:  python app.py
-# (Windows only -- requires pyaudiowpatch, which wraps WASAPI.)
-# """
-
-# import threading
-# import tkinter as tk
-# from tkinter import ttk, messagebox
-
-# import pyaudiowpatch as pyaudio
-
-# from ring_buffer import SyncRingBuffer
-# from capture import LoopbackCapture
-# from output import DeviceOutput
-
-# SAMPLERATE = 48000
-# CHANNELS = 2
-# RING_BUFFER_SECONDS = 10.0
-# BASE_SAFETY_MS = 150.0  # headroom so every device has room to be delayed further if needed
-
-
-# class App:
-#     def __init__(self, root: tk.Tk):
-#         self.root = root
-#         self.root.title("Synced Audio Mirror (prototype)")
-#         self.root.geometry("560x480")
-
-#         self.pa = pyaudio.PyAudio()
-#         self.ring_buffer = None
-#         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
-
-#         self.device_outputs = {}   # device_index -> DeviceOutput
-#         self.device_vars = {}      # device_index -> {"enabled": BoolVar, "delay": DoubleVar, "delay_label": StringVar}
-#         self.running = False
-#         self.source_delay = tk.DoubleVar(value=0.0)
-#         self.source_delay_label = tk.StringVar(value="0 ms")
-#         self._updating_buffers = False
-
-#         self._build_ui()
-#         self._populate_devices()
-
-#     # ------------------------------------------------------------- UI --
-
-#     def _build_ui(self):
-#         top = ttk.Frame(self.root, padding=10)
-#         top.pack(fill="x")
-
-#         self.start_btn = ttk.Button(top, text="Start Sync", command=self.start_sync)
-#         self.start_btn.pack(side="left")
-
-#         self.stop_btn = ttk.Button(top, text="Stop Sync", command=self.stop_sync, state="disabled")
-#         self.stop_btn.pack(side="left", padx=8)
-
-#         self.status_label = ttk.Label(top, text="Stopped")
-#         self.status_label.pack(side="left", padx=12)
-
-#         # Source delay controls (applies a global offset to all outputs)
-#         src = ttk.Frame(self.root, padding=(10, 6))
-#         src.pack(fill="x")
-#         ttk.Label(src, text="Source Delay:").pack(side="left")
-#         ttk.Button(src, text="-20", width=3, command=lambda: self._change_source_delay(-20)).pack(side="left", padx=(8,2))
-#         ttk.Button(src, text="-10", width=3, command=lambda: self._change_source_delay(-10)).pack(side="left")
-#         ttk.Label(src, textvariable=self.source_delay_label, width=8, anchor="center").pack(side="left", padx=(6,6))
-#         ttk.Button(src, text="+10", width=3, command=lambda: self._change_source_delay(10)).pack(side="left")
-#         ttk.Button(src, text="+20", width=3, command=lambda: self._change_source_delay(20)).pack(side="left", padx=(2,8))
-
-#         ttk.Label(
-#             self.root,
-#             text="Tip: after starting, nudge each device's delay slider until they sound in sync.\n"
-#                  "This compensates for that specific earbud's own Bluetooth latency.",
-#             wraplength=520, justify="left"
-#         ).pack(fill="x", padx=10, pady=(0, 6))
-
-#         self.devices_frame = ttk.Frame(self.root, padding=10)
-#         self.devices_frame.pack(fill="both", expand=True)
-
-#     def _populate_devices(self):
-#         devices = self.capture.list_output_devices()
-#         for info in devices:
-#             row = ttk.Frame(self.devices_frame, padding=4, relief="groove")
-#             row.pack(fill="x", pady=4)
-
-#             enabled_var = tk.BooleanVar(value=False)
-#             delay_var = tk.DoubleVar(value=0.0)
-#             delay_display = tk.StringVar(value="0 ms")
-#             buffer_display = tk.StringVar(value="buf: --")
-
-#             ttk.Checkbutton(row, text=info["name"], variable=enabled_var).pack(side="left")
-
-#             ttk.Label(row, text="Delay:").pack(side="left", padx=(20, 2))
-#             ttk.Button(row, text="-20", width=3, command=lambda idx=info["index"]: self._change_delay(idx, -20)).pack(side="left")
-#             ttk.Button(row, text="-10", width=3, command=lambda idx=info["index"]: self._change_delay(idx, -10)).pack(side="left")
-#             ttk.Label(row, textvariable=delay_display, width=8, anchor="center").pack(side="left", padx=(4, 4))
-#             ttk.Button(row, text="+10", width=3, command=lambda idx=info["index"]: self._change_delay(idx, 10)).pack(side="left")
-#             ttk.Button(row, text="+20", width=3, command=lambda idx=info["index"]: self._change_delay(idx, 20)).pack(side="left")
-
-#             self.device_vars[info["index"]] = {
-#                 "enabled": enabled_var,
-#                 "delay": delay_var,
-#                 "delay_label": delay_display,
-#                 "buffer_label": buffer_display,
-#                 "info": info,
-#             }
-
-#     def _update_buffer_displays(self):
-#         # periodic UI update showing frames available for each active reader
-#         if not self._updating_buffers:
-#             return
-#         for idx, dev in list(self.device_vars.items()):
-#             buf_var = dev.get("buffer_label")
-#             if not buf_var:
-#                 continue
-#             out = self.device_outputs.get(idx)
-#             if out:
-#                 try:
-#                     avail = self.ring_buffer.frames_available(out.reader)
-#                     ms = int((avail / float(self.ring_buffer.samplerate)) * 1000.0)
-#                     buf_var.set(f"buf: {ms}ms")
-#                 except Exception:
-#                     buf_var.set("buf: err")
-#             else:
-#                 buf_var.set("buf: --")
-
-#         # schedule next update
-#         self.root.after(250, self._update_buffer_displays)
-
-#     # --------------------------------------------------------- actions --
-
-#     def start_sync(self):
-#         selected = [d for idx, d in self.device_vars.items() if d["enabled"].get()]
-#         if not selected:
-#             messagebox.showwarning("No devices selected", "Check at least one output device to mirror to.")
-#             return
-
-#         try:
-#             samplerate = self.capture.prepare()
-#             self.ring_buffer = SyncRingBuffer(RING_BUFFER_SECONDS, CHANNELS, samplerate)
-#             self.capture.start(self.ring_buffer)
-#         except Exception as e:
-#             messagebox.showerror("Capture error", str(e))
-#             return
-
-#         for d in selected:
-#             info = d["info"]
-#             out = DeviceOutput(
-#                 self.pa, info, self.ring_buffer,
-#                 base_safety_ms=BASE_SAFETY_MS,
-#                 user_delay_ms=d["delay"].get() + self.source_delay.get(),
-#                 volume=1.0,
-#             )
-#             out.start()
-#             self.device_outputs[info["index"]] = out
-
-#         self.running = True
-#         self.status_label.config(text=f"Running -> {len(self.device_outputs)} device(s)")
-#         self.start_btn.config(state="disabled")
-#         self.stop_btn.config(state="normal")
-#         # start periodic buffer display updates
-#         self._updating_buffers = True
-#         self._update_buffer_displays()
-
-#     def stop_sync(self):
-#         for out in self.device_outputs.values():
-#             out.stop()
-#         self.device_outputs.clear()
-#         self.capture.stop()
-
-#         self.running = False
-#         self.status_label.config(text="Stopped")
-#         self.start_btn.config(state="normal")
-#         self.stop_btn.config(state="disabled")
-#         self._updating_buffers = False
-
-#     def _change_delay(self, device_index, delta_ms):
-#         device = self.device_vars.get(device_index)
-#         if not device:
-#             return
-
-#         current_delay = device["delay"].get()
-#         new_delay = max(-500.0, min(500.0, current_delay + delta_ms))
-#         device["delay"].set(new_delay)
-#         device["delay_label"].set(f"{int(new_delay)} ms")
-
-#         out = self.device_outputs.get(device_index)
-#         if out:
-#             combined = new_delay + self.source_delay.get()
-#             out.set_user_delay_ms(combined)
-
-#     def _change_source_delay(self, delta_ms):
-#         current = self.source_delay.get()
-#         new = max(-500.0, min(500.0, current + delta_ms))
-#         self.source_delay.set(new)
-#         self.source_delay_label.set(f"{int(new)} ms")
-
-#         # update all active outputs to include new global offset
-#         for idx, out in self.device_outputs.items():
-#             dev = self.device_vars.get(idx)
-#             if not dev:
-#                 continue
-#             user = dev["delay"].get()
-#             out.set_user_delay_ms(user + new)
-
-#     def on_close(self):
-#         if self.running:
-#             self.stop_sync()
-#         self.capture.close()
-#         self.pa.terminate()
-#         self.root.destroy()
-
-
-# def main():
-#     root = tk.Tk()
-#     app = App(root)
-#     root.protocol("WM_DELETE_WINDOW", app.on_close)
-#     root.mainloop()
-
-
-# if __name__ == "__main__":
-#     main()
-
-
 
 """
 app.py
@@ -270,13 +45,30 @@ BUFFER_METER_MAX_MS = 300.0  # meter is "full" at this many ms of headroom
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-BG = "#1a1d23"
-CARD_BG = "#232732"
+# ---- colour system -------------------------------------------------------
+# A real elevation ladder: page < card < nested row, plus a hairline border so
+# surfaces read as surfaces instead of blobs of near-identical grey.
+BG = "#101319"          # page
+CARD_BG = "#1a1e27"     # card surface
+CARD_HI = "#232936"     # nested rows inside a card
+BORDER = "#2a3040"      # hairline card border
+GHOST_BORDER = "#39415420"
 ACCENT = "#4da3ff"
+ACCENT_HOVER = "#3688dc"
 GOOD = "#3ecf6e"
 WARN = "#e8b93b"
 BAD = "#e8543b"
+TEXT = "#e8ecf4"
 TEXT_DIM = "#8b93a3"
+TEXT_FAINT = "#5d6577"
+
+# ---- spacing scale -------------------------------------------------------
+# Only these four values are allowed anywhere in the layout.
+PAD_XS, PAD_S, PAD_M, PAD_L = 4, 8, 14, 20
+
+# ---- type scale ----------------------------------------------------------
+# Four steps. Hierarchy comes from weight + colour, not from a fifth size.
+FS_LABEL, FS_BODY, FS_TITLE, FS_DISPLAY = 11, 13, 20, 24
 ARTWORK_ASPECT_RATIO = 16 / 9
 ARTWORK_WIDTH = 440
 ARTWORK_HEIGHT = round(ARTWORK_WIDTH / ARTWORK_ASPECT_RATIO)
@@ -395,7 +187,8 @@ class DeviceCard(ctk.CTkFrame):
     """One row per audio output device: enable toggle, delay control, live buffer meter."""
 
     def __init__(self, master, info, on_toggle, on_delay_change):
-        super().__init__(master, fg_color=CARD_BG, corner_radius=10)
+        super().__init__(master, fg_color=CARD_BG, corner_radius=10,
+                         border_width=1, border_color=BORDER)
         self.info = info
         self.on_toggle = on_toggle
         self.on_delay_change = on_delay_change
@@ -403,16 +196,17 @@ class DeviceCard(ctk.CTkFrame):
         self.enabled_var = tk.BooleanVar(value=False)
         self.delay_var = tk.DoubleVar(value=0.0)
 
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
         # -- top row: name + enable switch --
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=14, pady=(12, 4))
+        top.grid(row=0, column=0, sticky="ew", padx=PAD_M, pady=(PAD_M, PAD_S))
         top.grid_columnconfigure(0, weight=1)
 
         name = info["name"]
         display_name = name if len(name) <= 42 else name[:39] + "..."
-        ctk.CTkLabel(top, text=display_name, font=ctk.CTkFont(size=14, weight="bold"),
+        ctk.CTkLabel(top, text=display_name, text_color=TEXT,
+                     font=ctk.CTkFont(size=FS_BODY, weight="bold"),
                      anchor="w").grid(row=0, column=0, sticky="w")
 
         self.switch = ctk.CTkSwitch(
@@ -421,52 +215,63 @@ class DeviceCard(ctk.CTkFrame):
         )
         self.switch.grid(row=0, column=1, sticky="e")
 
-        # -- delay row --
+        # -- delay row: nudges folded in beside the slider (was its own row) --
         delay_row = ctk.CTkFrame(self, fg_color="transparent")
-        delay_row.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 4))
-        delay_row.grid_columnconfigure(1, weight=1)
+        delay_row.grid(row=1, column=0, sticky="ew", padx=PAD_M, pady=(0, PAD_S))
+        delay_row.grid_columnconfigure(2, weight=1)
 
-        ctk.CTkLabel(delay_row, text="Delay", text_color=TEXT_DIM, width=44,
-                     anchor="w").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(delay_row, text="DELAY", text_color=TEXT_FAINT, width=44, anchor="w",
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")
+                     ).grid(row=0, column=0, sticky="w")
+
+        self._nudge_btn(delay_row, "\u2212", -5).grid(row=0, column=1, padx=(0, PAD_S))
 
         self.delay_slider = ctk.CTkSlider(
             delay_row, from_=DELAY_MIN, to=DELAY_MAX, variable=self.delay_var,
             command=self._delay_changed, progress_color=ACCENT, button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER, height=14,
         )
-        self.delay_slider.grid(row=0, column=1, sticky="ew", padx=10)
+        self.delay_slider.grid(row=0, column=2, sticky="ew")
 
-        self.delay_label = ctk.CTkLabel(delay_row, text="0 ms", width=56, anchor="e")
-        self.delay_label.grid(row=0, column=2, sticky="e")
+        self._nudge_btn(delay_row, "+", 5).grid(row=0, column=3, padx=(PAD_S, PAD_S))
 
-        # -- nudge buttons for fine control --
-        nudge_row = ctk.CTkFrame(self, fg_color="transparent")
-        nudge_row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 4))
-        for label, delta in (("-20", -20), ("-5", -5), ("+5", 5), ("+20", 20)):
-            ctk.CTkButton(
-                nudge_row, text=label, width=44, height=22, fg_color="#2d3340",
-                hover_color="#3a4152", font=ctk.CTkFont(size=11),
-                command=lambda d=delta: self._nudge(d),
-            ).pack(side="left", padx=(0, 6))
+        self.delay_label = ctk.CTkLabel(delay_row, text="0 ms", width=56, anchor="e",
+                                        text_color=TEXT,
+                                        font=ctk.CTkFont(size=FS_LABEL, weight="bold"))
+        self.delay_label.grid(row=0, column=4, sticky="e")
 
-        # -- buffer meter + stutter badge --
+        # -- buffer meter with the stutter state folded in as a badge --
         meter_row = ctk.CTkFrame(self, fg_color="transparent")
-        meter_row.grid(row=3, column=0, columnspan=2, sticky="ew", padx=14, pady=(2, 12))
+        meter_row.grid(row=2, column=0, sticky="ew", padx=PAD_M, pady=(0, PAD_M))
         meter_row.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(meter_row, text="Buffer", text_color=TEXT_DIM, width=44,
-                     anchor="w").grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(meter_row, text="BUFFER", text_color=TEXT_FAINT, width=44, anchor="w",
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")
+                     ).grid(row=0, column=0, sticky="w")
 
-        self.buffer_bar = ctk.CTkProgressBar(meter_row, progress_color=GOOD, height=8)
+        self.buffer_bar = ctk.CTkProgressBar(meter_row, progress_color=GOOD, height=6,
+                                             fg_color=CARD_HI, corner_radius=3)
         self.buffer_bar.set(0)
-        self.buffer_bar.grid(row=0, column=1, sticky="ew", padx=10)
+        self.buffer_bar.grid(row=0, column=1, sticky="ew", padx=PAD_S)
 
-        self.buffer_label = ctk.CTkLabel(meter_row, text="-- ms", width=56, anchor="e",
-                                          text_color=TEXT_DIM, font=ctk.CTkFont(size=11))
+        self.buffer_label = ctk.CTkLabel(meter_row, text="--", width=52, anchor="e",
+                                         text_color=TEXT_DIM,
+                                         font=ctk.CTkFont(size=FS_LABEL))
         self.buffer_label.grid(row=0, column=2, sticky="e")
 
-        self.stutter_label = ctk.CTkLabel(self, text="", text_color=TEXT_DIM,
-                                           font=ctk.CTkFont(size=11), anchor="w")
-        self.stutter_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 10))
+        self.stutter_label = ctk.CTkLabel(meter_row, text="", width=64, anchor="e",
+                                          text_color=TEXT_FAINT,
+                                          font=ctk.CTkFont(size=FS_LABEL))
+        self.stutter_label.grid(row=0, column=3, sticky="e", padx=(PAD_S, 0))
+
+    def _nudge_btn(self, master, label, delta):
+        return ctk.CTkButton(
+            master, text=label, width=24, height=24, corner_radius=12,
+            fg_color="transparent", hover_color=CARD_HI, border_width=1,
+            border_color=BORDER, text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=FS_BODY, weight="bold"),
+            command=lambda d=delta: self._nudge(d),
+        )
 
     def _toggled(self):
         self.on_toggle(self.info["name"], self.enabled_var.get())
@@ -484,7 +289,7 @@ class DeviceCard(ctk.CTkFrame):
     def update_live_stats(self, buffer_ms, stutter_count, active: bool):
         if not active:
             self.buffer_bar.set(0)
-            self.buffer_bar.configure(progress_color="#3a4152")
+            self.buffer_bar.configure(progress_color=CARD_HI)
             self.buffer_label.configure(text="--")
             self.stutter_label.configure(text="")
             return
@@ -501,10 +306,7 @@ class DeviceCard(ctk.CTkFrame):
         self.buffer_label.configure(text=f"{int(buffer_ms)} ms")
 
         if stutter_count > 0:
-            self.stutter_label.configure(
-                text=f"⚠ {stutter_count} stutter{'s' if stutter_count != 1 else ''} this session",
-                text_color=WARN,
-            )
+            self.stutter_label.configure(text=f"⚠ {stutter_count}", text_color=WARN)
         else:
             self.stutter_label.configure(text="✓ clean", text_color=GOOD)
 
@@ -649,168 +451,210 @@ class App:
 
     def _build_ui(self):
         header = ctk.CTkFrame(self.root, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=(20, 8))
+        header.pack(fill="x", padx=PAD_L, pady=(PAD_L, PAD_S))
 
         title_row = ctk.CTkFrame(header, fg_color="transparent")
         title_row.pack(fill="x")
 
-        ctk.CTkLabel(title_row, text="SyncMirror", font=ctk.CTkFont(size=22, weight="bold")
-                     ).pack(side="left")
+        ctk.CTkLabel(title_row, text="SyncMirror", text_color=TEXT,
+                     font=ctk.CTkFont(size=FS_DISPLAY, weight="bold")).pack(side="left")
 
-        status_frame = ctk.CTkFrame(title_row, fg_color="transparent")
+        status_frame = ctk.CTkFrame(title_row, fg_color=CARD_BG, corner_radius=14,
+                                    border_width=1, border_color=BORDER)
         status_frame.pack(side="right")
-        self.status_dot = ctk.CTkLabel(status_frame, text="●", text_color=BAD,
-                                        font=ctk.CTkFont(size=16))
-        self.status_dot.pack(side="left", padx=(0, 6))
-        self.status_label = ctk.CTkLabel(status_frame, text="Stopped", text_color=TEXT_DIM)
-        self.status_label.pack(side="left")
+        self.status_dot = ctk.CTkLabel(status_frame, text="\u25cf", text_color=BAD,
+                                       font=ctk.CTkFont(size=FS_BODY))
+        self.status_dot.pack(side="left", padx=(PAD_M, PAD_S), pady=PAD_XS)
+        self.status_label = ctk.CTkLabel(status_frame, text="Stopped", text_color=TEXT_DIM,
+                                         font=ctk.CTkFont(size=FS_LABEL, weight="bold"))
+        self.status_label.pack(side="left", padx=(0, PAD_M))
+        self._pulse_phase = 0
+        self._pulse_status_dot()
 
         ctk.CTkLabel(header, text="Synchronized audio mirroring across Bluetooth devices",
-                     text_color=TEXT_DIM, font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(2, 0))
+                     text_color=TEXT_FAINT, font=ctk.CTkFont(size=FS_LABEL)
+                     ).pack(anchor="w", pady=(PAD_XS, 0))
 
         # -- split workspace: playback on the left, sync/devices on the right --
         workspace = ctk.CTkFrame(self.root, fg_color="transparent")
-        workspace.pack(fill="both", expand=True, padx=20, pady=(4, 20))
+        workspace.pack(fill="both", expand=True, padx=PAD_L, pady=(PAD_S, PAD_L))
         workspace.grid_columnconfigure(0, weight=1, uniform="pane")
         workspace.grid_columnconfigure(1, weight=1, uniform="pane")
         workspace.grid_rowconfigure(0, weight=1)
 
-        playback = ctk.CTkFrame(workspace, fg_color=CARD_BG, corner_radius=10)
-        playback.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        playback = ctk.CTkFrame(workspace, fg_color=CARD_BG, corner_radius=12,
+                                border_width=1, border_color=BORDER)
+        playback.grid(row=0, column=0, sticky="nsew", padx=(0, PAD_S))
         playback.grid_columnconfigure(0, weight=1)
         playback.bind("<Configure>", self._schedule_artwork_resize)
+        self.playback_pane = playback
 
         devices_pane = ctk.CTkFrame(workspace, fg_color="transparent")
-        devices_pane.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        devices_pane.grid(row=0, column=1, sticky="nsew", padx=(PAD_S, 0))
 
-        # -- sync controls and devices --
-        controls = ctk.CTkFrame(devices_pane, fg_color=CARD_BG, corner_radius=10)
-        controls.pack(fill="x", pady=(0, 8))
+        # -- sync controls --
+        controls = ctk.CTkFrame(devices_pane, fg_color=CARD_BG, corner_radius=12,
+                                border_width=1, border_color=BORDER)
+        controls.pack(fill="x", pady=(0, PAD_S))
 
         btn_row = ctk.CTkFrame(controls, fg_color="transparent")
-        btn_row.pack(fill="x", padx=14, pady=(14, 10))
+        btn_row.pack(fill="x", padx=PAD_M, pady=(PAD_M, PAD_S))
 
+        # Only the primary action is filled; everything else is a ghost button.
         self.start_btn = ctk.CTkButton(btn_row, text="Start Sync", command=self.start_sync,
-                                        fg_color=GOOD, hover_color="#33b35f", width=120)
+                                       fg_color=GOOD, hover_color="#33b35f", width=118,
+                                       height=34, corner_radius=8,
+                                       font=ctk.CTkFont(size=FS_BODY, weight="bold"))
         self.start_btn.pack(side="left")
 
-        self.stop_btn = ctk.CTkButton(btn_row, text="Stop", command=self.stop_sync,
-                                       fg_color="#3a4152", hover_color="#4a5162", width=90,
-                                       state="disabled")
-        self.stop_btn.pack(side="left", padx=8)
+        self.stop_btn = self._ghost_button(btn_row, "Stop", self.stop_sync, width=80)
+        self.stop_btn.configure(state="disabled")
+        self.stop_btn.pack(side="left", padx=(PAD_S, 0))
 
-        self.reset_btn = ctk.CTkButton(btn_row, text="Reset Sync", command=self._reset_adaptive_delays,
-                                        fg_color="#3a4152", hover_color="#4a5162", width=90,
-                                        state="disabled")
-        self.reset_btn.pack(side="left", padx=(0, 8))
+        self.reset_btn = self._ghost_button(btn_row, "Reset Sync", self._reset_adaptive_delays,
+                                            width=98)
+        self.reset_btn.configure(state="disabled")
+        self.reset_btn.pack(side="left", padx=(PAD_S, 0))
 
-        self.refresh_btn = ctk.CTkButton(btn_row, text="Refresh Devices", command=self._populate_devices,
-                                         fg_color="#3a4152", hover_color="#3a4152", width=100)
-        self.refresh_btn.pack(side="left", padx=(0, 8))
+        src_row = ctk.CTkFrame(controls, fg_color=CARD_HI, corner_radius=8)
+        src_row.pack(fill="x", padx=PAD_M, pady=(0, PAD_M))
+        ctk.CTkLabel(src_row, text="GLOBAL SOURCE DELAY", text_color=TEXT_FAINT,
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")
+                     ).pack(side="left", padx=PAD_M, pady=PAD_S)
 
-        src_row = ctk.CTkFrame(controls, fg_color="transparent")
-        src_row.pack(fill="x", padx=14, pady=(0, 14))
-        ctk.CTkLabel(src_row, text="Global source delay", text_color=TEXT_DIM
-                     ).pack(side="left")
-        self.source_delay_label = ctk.CTkLabel(src_row, text="0 ms", width=56)
+        self.source_delay_label = ctk.CTkLabel(src_row, text="0 ms", width=56,
+                                               text_color=TEXT,
+                                               font=ctk.CTkFont(size=FS_BODY, weight="bold"))
         for label, delta in (("-20", -20), ("-10", -10)):
-            ctk.CTkButton(src_row, text=label, width=44, height=24, fg_color="#2d3340",
-                          hover_color="#3a4152", font=ctk.CTkFont(size=11),
-                          command=lambda d=delta: self._change_source_delay(d)
-                          ).pack(side="left", padx=(14, 4))
-        self.source_delay_label.pack(side="left", padx=6)
+            self._ghost_button(src_row, label, lambda d=delta: self._change_source_delay(d),
+                               width=42, height=24, small=True
+                               ).pack(side="left", padx=(0, PAD_XS))
+        self.source_delay_label.pack(side="left", padx=PAD_S)
         for label, delta in (("+10", 10), ("+20", 20)):
-            ctk.CTkButton(src_row, text=label, width=44, height=24, fg_color="#2d3340",
-                          hover_color="#3a4152", font=ctk.CTkFont(size=11),
-                          command=lambda d=delta: self._change_source_delay(d)
-                          ).pack(side="left", padx=(4, 0))
+            self._ghost_button(src_row, label, lambda d=delta: self._change_source_delay(d),
+                               width=42, height=24, small=True
+                               ).pack(side="left", padx=(0, PAD_XS))
 
         # -- playback area --
         artwork_frame = ctk.CTkFrame(
-            playback, fg_color="#161923", corner_radius=8,
+            playback, fg_color="#0c0f16", corner_radius=10,
             width=ARTWORK_WIDTH, height=ARTWORK_HEIGHT,
         )
-        artwork_frame.grid(row=0, column=0, padx=14, pady=(14, 10))
+        artwork_frame.grid(row=0, column=0, padx=PAD_M, pady=(PAD_M, PAD_M))
         artwork_frame.grid_propagate(False)
         self.artwork_frame = artwork_frame
         self.artwork_label = tk.Label(
-            artwork_frame, text="No artwork", bg="#161923", fg=TEXT_DIM,
-            borderwidth=0, highlightthickness=0,
+            artwork_frame, text="\u266a", bg="#0c0f16", fg="#2a3040",
+            font=("Segoe UI", 44), borderwidth=0, highlightthickness=0,
         )
         self.artwork_label.pack(fill="both", expand=True)
 
         playback_header = ctk.CTkFrame(playback, fg_color="transparent")
-        playback_header.grid(row=1, column=0, sticky="ew", padx=14)
+        playback_header.grid(row=1, column=0, sticky="ew", padx=PAD_M)
         playback_header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(playback_header, text="NOW PLAYING", text_color=TEXT_DIM,
-                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(playback_header, text="NOW PLAYING", text_color=TEXT_FAINT,
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")
+                     ).grid(row=0, column=0, sticky="w")
         self.playback_status_label = ctk.CTkLabel(playback_header, text="NO SESSION",
-                                                   text_color=TEXT_DIM, font=ctk.CTkFont(size=11))
+                                                  text_color=TEXT_FAINT,
+                                                  font=ctk.CTkFont(size=FS_LABEL, weight="bold"))
         self.playback_status_label.grid(row=0, column=1, sticky="e")
 
+        # Title / artist carry the hierarchy; album + source collapse to one dim line.
         self.track_name_label = ctk.CTkLabel(
-            playback, text="Song: No active track detected", anchor="w", justify="left",
-            font=ctk.CTkFont(size=15, weight="bold"), wraplength=1200,
+            playback, text="No active track detected", anchor="w", justify="left",
+            text_color=TEXT, font=ctk.CTkFont(size=FS_TITLE, weight="bold"),
         )
-        self.track_name_label.grid(row=2, column=0, sticky="ew", padx=14, pady=(6, 0))
+        self.track_name_label.grid(row=2, column=0, sticky="ew", padx=PAD_M, pady=(PAD_S, 0))
         self.track_artist_label = ctk.CTkLabel(
-            playback, text="Artist: Start playback in another app.", anchor="w", justify="left",
-            font=ctk.CTkFont(size=13), wraplength=1200,
+            playback, text="Start playback in another app", anchor="w", justify="left",
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=FS_BODY),
         )
-        self.track_artist_label.grid(row=3, column=0, sticky="ew", padx=14, pady=(2, 0))
-        self.track_album_label = ctk.CTkLabel(
-            playback, text="Album: —", anchor="w", justify="left", text_color=TEXT_DIM,
-            font=ctk.CTkFont(size=12), wraplength=1200,
+        self.track_artist_label.grid(row=3, column=0, sticky="ew", padx=PAD_M, pady=(PAD_XS, 0))
+        self.track_meta_label = ctk.CTkLabel(
+            playback, text="", anchor="w", justify="left", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_LABEL),
         )
-        self.track_album_label.grid(row=4, column=0, sticky="ew", padx=14, pady=(2, 0))
-        self.track_source_label = ctk.CTkLabel(
-            playback, text="Source: —", anchor="w", justify="left", text_color=TEXT_DIM,
-            font=ctk.CTkFont(size=12), wraplength=1200,
-        )
-        self.track_source_label.grid(row=5, column=0, sticky="ew", padx=14, pady=(2, 0))
-        self.track_time_label = ctk.CTkLabel(
-            playback, text="Time: --:-- / --:--", anchor="w", justify="left", text_color=TEXT_DIM,
-            font=ctk.CTkFont(size=12), wraplength=1200,
-        )
-        self.track_time_label.grid(row=6, column=0, sticky="ew", padx=14, pady=(2, 0))
-        self.track_progress = ctk.CTkProgressBar(playback, progress_color=ACCENT, height=7)
+        self.track_meta_label.grid(row=4, column=0, sticky="ew", padx=PAD_M, pady=(PAD_XS, 0))
+
+        self.track_progress = ctk.CTkProgressBar(playback, progress_color=ACCENT, height=5,
+                                                 fg_color=CARD_HI, corner_radius=3)
         self.track_progress.set(0)
-        self.track_progress.grid(row=7, column=0, sticky="ew", padx=14, pady=(7, 0))
+        self.track_progress.grid(row=5, column=0, sticky="ew", padx=PAD_M, pady=(PAD_M, PAD_XS))
 
-        media_row = ctk.CTkFrame(playback, fg_color="#161923", corner_radius=8)
-        media_row.grid(row=8, column=0, sticky="ew", padx=14, pady=(10, 14))
-        media_row.configure(fg_color="transparent")
-        transport = ctk.CTkFrame(media_row, fg_color="transparent")
-        transport.pack(pady=(4, 10))
+        # Elapsed / remaining sit at the ends of the bar instead of on their own line.
+        time_row = ctk.CTkFrame(playback, fg_color="transparent")
+        time_row.grid(row=6, column=0, sticky="ew", padx=PAD_M)
+        time_row.grid_columnconfigure(0, weight=1)
+        self.track_time_label = ctk.CTkLabel(time_row, text="--:--", text_color=TEXT_FAINT,
+                                             font=ctk.CTkFont(size=FS_LABEL))
+        self.track_time_label.grid(row=0, column=0, sticky="w")
+        self.track_remaining_label = ctk.CTkLabel(time_row, text="--:--", text_color=TEXT_FAINT,
+                                                  font=ctk.CTkFont(size=FS_LABEL))
+        self.track_remaining_label.grid(row=0, column=1, sticky="e")
+
+        transport = ctk.CTkFrame(playback, fg_color="transparent")
+        transport.grid(row=7, column=0, pady=(PAD_M, PAD_M))
         self.prev_btn = ctk.CTkButton(
-            transport, text="⏮", width=44, height=44, corner_radius=22,
-            command=self._media_previous, fg_color="transparent", hover_color="#2d3340",
-            font=ctk.CTkFont(size=18),
+            transport, text="\u23ee", width=40, height=40, corner_radius=20,
+            command=self._media_previous, fg_color="transparent", hover_color=CARD_HI,
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=16),
         )
-        self.prev_btn.pack(side="left", padx=12)
+        self.prev_btn.pack(side="left", padx=PAD_M)
         self.play_btn = ctk.CTkButton(
-            transport, text="▶", width=54, height=54, corner_radius=27,
-            command=self._media_play_pause, fg_color=ACCENT, hover_color="#3688dc",
-            font=ctk.CTkFont(size=21, weight="bold"),
+            transport, text="\u25b6", width=52, height=52, corner_radius=26,
+            command=self._media_play_pause, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            font=ctk.CTkFont(size=18, weight="bold"),
         )
-        self.play_btn.pack(side="left", padx=12)
+        self.play_btn.pack(side="left", padx=PAD_M)
         self.next_btn = ctk.CTkButton(
-            transport, text="⏭", width=44, height=44, corner_radius=22,
-            command=self._media_next, fg_color="transparent", hover_color="#2d3340",
-            font=ctk.CTkFont(size=18),
+            transport, text="\u23ed", width=40, height=40, corner_radius=20,
+            command=self._media_next, fg_color="transparent", hover_color=CARD_HI,
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=16),
         )
-        self.next_btn.pack(side="left", padx=12)
+        self.next_btn.pack(side="left", padx=PAD_M)
 
-        ctk.CTkLabel(
-            devices_pane,
-            text="Tip: start sync, play audio, then nudge each device's delay until they line up.\n"
-                 "Each earbud has its own Bluetooth latency, so each needs its own value.",
-            text_color=TEXT_DIM, font=ctk.CTkFont(size=11), justify="left",
-        ).pack(anchor="w", padx=22, pady=(4, 8))
+        # -- devices list header: refresh demoted to an icon-tier action --
+        devices_header = ctk.CTkFrame(devices_pane, fg_color="transparent")
+        devices_header.pack(fill="x", padx=PAD_XS, pady=(PAD_S, PAD_XS))
+        ctk.CTkLabel(devices_header, text="OUTPUT DEVICES", text_color=TEXT_FAINT,
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")).pack(side="left")
+        self.refresh_btn = ctk.CTkButton(
+            devices_header, text="\u27f3", width=26, height=26, corner_radius=13,
+            command=self._populate_devices, fg_color="transparent", hover_color=CARD_HI,
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=FS_BODY),
+        )
+        self.refresh_btn.pack(side="right")
 
         # -- scrollable device list --
         self.devices_frame = ctk.CTkScrollableFrame(devices_pane, fg_color="transparent")
         self.devices_frame.pack(fill="both", expand=True)
+
+        ctk.CTkLabel(
+            devices_pane,
+            text="Tip: start sync, play audio, then nudge each device's delay until they line up.",
+            text_color=TEXT_FAINT, font=ctk.CTkFont(size=FS_LABEL), justify="left",
+        ).pack(anchor="w", padx=PAD_XS, pady=(PAD_S, 0))
+
+    def _ghost_button(self, master, text, command, width=90, height=34, small=False):
+        """Secondary action: outlined, transparent, never competing with Start."""
+        return ctk.CTkButton(
+            master, text=text, command=command, width=width, height=height,
+            corner_radius=8 if not small else 6, fg_color="transparent",
+            hover_color=CARD_HI, border_width=1, border_color=BORDER,
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=FS_LABEL if small else FS_BODY,
+                             weight="normal" if small else "bold"),
+        )
+
+    def _pulse_status_dot(self):
+        """Soft breathing pulse on the status dot while sync is running."""
+        if getattr(self, "running", False):
+            self._pulse_phase = (self._pulse_phase + 1) % 20
+            t = abs(10 - self._pulse_phase) / 10.0
+            shades = ("#2b8f4f", "#33a95d", "#3ecf6e", "#63e08c")
+            self.status_dot.configure(text_color=shades[int(t * (len(shades) - 1))])
+        self.root.after(90, self._pulse_status_dot)
 
     def _populate_devices(self):
         """Trigger a device scan. Runs off the UI thread since re-enumerating WASAPI
@@ -1176,6 +1020,9 @@ class App:
         self._artwork_width = width
         self._artwork_height = height
         self.artwork_frame.configure(width=width, height=height)
+        # Text wraps to the real pane width instead of a fixed 1200px that never wrapped.
+        for lbl in (self.track_name_label, self.track_artist_label, self.track_meta_label):
+            lbl.configure(wraplength=width)
         if self._artwork_resize_handle is not None:
             self.root.after_cancel(self._artwork_resize_handle)
         self._artwork_resize_handle = self.root.after(100, self._redraw_artwork)
@@ -1427,14 +1274,17 @@ class App:
         position = self._timeline_position_seconds
         duration = self._timeline_duration_seconds
         if position is None or duration is None:
-            self.track_time_label.configure(text="Time: --:-- / --:--")
+            self.track_time_label.configure(text="--:--")
+            self.track_remaining_label.configure(text="--:--")
             self.track_progress.set(0)
             return
         if self._timeline_playing:
             position += time.monotonic() - self._timeline_anchor
         position = min(position, duration) if duration else position
-        self.track_time_label.configure(
-            text=f"Time: {self._format_media_time_seconds(position)} / {self._format_media_time_seconds(duration)}"
+        self.track_time_label.configure(text=self._format_media_time_seconds(position))
+        remaining = max(0, (duration or 0) - position)
+        self.track_remaining_label.configure(
+            text=f"-{self._format_media_time_seconds(remaining)}" if duration else "--:--"
         )
         self.track_progress.set(min(1.0, position / duration) if duration else 0)
 
@@ -1512,10 +1362,10 @@ class App:
                 self._timeline_duration_seconds = duration_seconds or self._timeline_duration_seconds
                 self._timeline_track_key = track_key
                 self._timeline_playing = status == "PLAYING"
-                self.track_name_label.configure(text=f"Song: {title}")
-                self.track_artist_label.configure(text=f"Artist: {artist}")
-                self.track_album_label.configure(text=f"Album: {album or 'No album information'}")
-                self.track_source_label.configure(text=f"Source: {source}")
+                self.track_name_label.configure(text=title)
+                self.track_artist_label.configure(text=artist)
+                meta = "  \u00b7  ".join(x for x in (album or "", source or "") if x)
+                self.track_meta_label.configure(text=meta)
                 self._render_playback_clock()
                 self.playback_status_label.configure(text=status, text_color=GOOD if status == "PLAYING" else TEXT_DIM)
                 self.play_btn.configure(text="⏸" if status == "PLAYING" else "▶")
@@ -1526,11 +1376,11 @@ class App:
                 if time.monotonic() - self._last_track_seen_at < 5.0:
                     self.playback_status_label.configure(text="CHANGING", text_color=TEXT_DIM)
                     return
-                self.track_name_label.configure(text="Song: No active playback session")
-                self.track_artist_label.configure(text="Artist: Start playback in another app.")
-                self.track_album_label.configure(text="Album: —")
-                self.track_source_label.configure(text="Source: —")
-                self.track_time_label.configure(text="Time: --:-- / --:--")
+                self.track_name_label.configure(text="No active playback session")
+                self.track_artist_label.configure(text="Start playback in another app")
+                self.track_meta_label.configure(text="")
+                self.track_time_label.configure(text="--:--")
+                self.track_remaining_label.configure(text="--:--")
                 self._timeline_position_seconds = None
                 self._timeline_duration_seconds = None
                 self._timeline_playing = False
@@ -1541,12 +1391,12 @@ class App:
                 self._artwork_key = None
                 self._set_artwork(None)
         else:
-            self.track_name_label.configure(text="Song: Media metadata unavailable")
+            self.track_name_label.configure(text="Media metadata unavailable")
             error = error or "WinRT media control could not be initialized."
-            self.track_artist_label.configure(text=f"Artist: {error}")
-            self.track_album_label.configure(text="Album: —")
-            self.track_source_label.configure(text="Source: —")
-            self.track_time_label.configure(text="Time: --:-- / --:--")
+            self.track_artist_label.configure(text=error)
+            self.track_meta_label.configure(text="")
+            self.track_time_label.configure(text="--:--")
+            self.track_remaining_label.configure(text="--:--")
             self._timeline_position_seconds = None
             self._timeline_duration_seconds = None
             self._timeline_playing = False
