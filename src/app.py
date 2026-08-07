@@ -1,4 +1,3 @@
-
 """
 app.py
 
@@ -7,6 +6,17 @@ UI for the multi-device synced audio mirror, built on customtkinter.
 Run with:  python app.py
 (Windows only -- requires pyaudiowpatch, which wraps WASAPI.)
 """
+import os
+import sys
+
+# When the frozen exe relaunches itself purely to scan audio devices (see
+# capture.enumerate_output_devices), do that and exit before loading the GUI --
+# otherwise every device scan would open another app window.
+if getattr(sys, "frozen", False) and "--enumerate-devices" in sys.argv:
+    from capture import emit_enumeration
+    _args = sys.argv[sys.argv.index("--enumerate-devices") + 1:]
+    emit_enumeration(_args[0] if _args else None)
+    sys.exit(0)
 
 import asyncio
 import ctypes
@@ -42,25 +52,44 @@ BASE_SAFETY_MS = 150.0
 DELAY_MIN, DELAY_MAX = -500.0, 500.0
 BUFFER_METER_MAX_MS = 300.0  # meter is "full" at this many ms of headroom
 
-ctk.set_appearance_mode("dark")
+# Default to the OS theme; the user can override it from the header switcher.
+ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
 # ---- colour system -------------------------------------------------------
 # A real elevation ladder: page < card < nested row, plus a hairline border so
 # surfaces read as surfaces instead of blobs of near-identical grey.
-BG = "#101319"          # page
-CARD_BG = "#1a1e27"     # card surface
-CARD_HI = "#232936"     # nested rows inside a card
-BORDER = "#2a3040"      # hairline card border
-GHOST_BORDER = "#39415420"
-ACCENT = "#4da3ff"
-ACCENT_HOVER = "#3688dc"
-GOOD = "#3ecf6e"
-WARN = "#e8b93b"
-BAD = "#e8543b"
-TEXT = "#e8ecf4"
-TEXT_DIM = "#8b93a3"
-TEXT_FAINT = "#5d6577"
+# Every colour is a (light, dark) pair so CustomTkinter widgets follow the
+# active appearance mode automatically; raw tk/PIL surfaces resolve via _c().
+BG = ("#f2f4f8", "#101319")          # page
+CARD_BG = ("#ffffff", "#1a1e27")     # card surface
+CARD_HI = ("#e8ebf1", "#232936")     # nested rows inside a card
+BORDER = ("#d4d9e2", "#2a3040")      # hairline card border
+GHOST_BORDER = ("#c3cad6", "#39415420")
+ACCENT = ("#2b7fff", "#4da3ff")
+ACCENT_HOVER = ("#1f6fe6", "#3688dc")
+GOOD = ("#1ca94c", "#3ecf6e")
+WARN = ("#c8901a", "#e8b93b")
+BAD = ("#d63a20", "#e8543b")
+TEXT = ("#1a1e27", "#e8ecf4")
+TEXT_DIM = ("#2b303d", "#8b93a3")
+TEXT_FAINT = ("#454b5a", "#5d6577")
+
+# Artwork stage / placeholder colours for the raw tk.Label + PIL backdrop,
+# which don't auto-follow the appearance mode. Resolved through _c().
+ARTWORK_BG = ("#e4e8f0", "#0c0f16")
+ARTWORK_PLACEHOLDER_FG = ("#c0c6d2", "#2a3040")
+ARTWORK_EMPTY_RGB = ((228, 232, 240), (22, 25, 35))
+
+
+def _c(color):
+    """Resolve a (light, dark) colour pair to the active appearance mode.
+
+    CustomTkinter widgets accept the pair directly, but raw tk widgets and
+    PIL rendering need a single concrete value for the current theme."""
+    if isinstance(color, (tuple, list)) and len(color) == 2:
+        return color[0] if ctk.get_appearance_mode() == "Light" else color[1]
+    return color
 
 # ---- spacing scale -------------------------------------------------------
 # Only these four values are allowed anywhere in the layout.
@@ -84,6 +113,17 @@ VK_MEDIA_STOP = 0xB2
 VK_MEDIA_PLAY_PAUSE = 0xB3
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
+
+
+def resource_path(relative):
+    """Resolve a bundled resource path, working from source and a PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        return os.path.join(base, relative)
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), relative)
+
+
+ICON_PATH = resource_path("SyncMirror.ico")
 
 
 class MediaController:
@@ -396,6 +436,10 @@ class App:
         self.root.geometry("1280x780")
         self.root.minsize(1080, 650)
         self.root.configure(fg_color=BG)
+        try:
+            self.root.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
 
         self.ring_buffer = None
         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
@@ -471,6 +515,18 @@ class App:
         self._pulse_phase = 0
         self._pulse_status_dot()
 
+        # -- theme switcher: defaults to the OS theme, user can pin Light/Dark --
+        self.theme_var = tk.StringVar(value="System")
+        self.theme_switcher = ctk.CTkSegmentedButton(
+            title_row, values=["System", "Light", "Dark"], variable=self.theme_var,
+            command=self._on_theme_change, fg_color=CARD_BG, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER, unselected_color=CARD_BG,
+            unselected_hover_color=CARD_HI, text_color=TEXT_DIM,
+            border_width=1, corner_radius=14,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        )
+        self.theme_switcher.pack(side="right", padx=(0, PAD_S))
+
         ctk.CTkLabel(header, text="Synchronized audio mirroring across Bluetooth devices",
                      text_color=TEXT_FAINT, font=ctk.CTkFont(size=FS_LABEL)
                      ).pack(anchor="w", pady=(PAD_XS, 0))
@@ -537,14 +593,14 @@ class App:
 
         # -- playback area --
         artwork_frame = ctk.CTkFrame(
-            playback, fg_color="#0c0f16", corner_radius=10,
+            playback, fg_color=ARTWORK_BG, corner_radius=10,
             width=ARTWORK_WIDTH, height=ARTWORK_HEIGHT,
         )
         artwork_frame.grid(row=0, column=0, padx=PAD_M, pady=(PAD_M, PAD_M))
         artwork_frame.grid_propagate(False)
         self.artwork_frame = artwork_frame
         self.artwork_label = tk.Label(
-            artwork_frame, text="\u266a", bg="#0c0f16", fg="#2a3040",
+            artwork_frame, text="\u266a", bg=_c(ARTWORK_BG), fg=_c(ARTWORK_PLACEHOLDER_FG),
             font=("Segoe UI", 44), borderwidth=0, highlightthickness=0,
         )
         self.artwork_label.pack(fill="both", expand=True)
@@ -656,6 +712,22 @@ class App:
             self.status_dot.configure(text_color=shades[int(t * (len(shades) - 1))])
         self.root.after(90, self._pulse_status_dot)
 
+    def _on_theme_change(self, choice):
+        """Switch appearance mode. CustomTkinter widgets follow the (light, dark)
+        colour pairs automatically; the raw tk.Label + PIL backdrop are refreshed
+        by hand since they don't observe the appearance-mode change."""
+        ctk.set_appearance_mode(choice)  # "System" / "Light" / "Dark"
+        self._apply_manual_theme()
+
+    def _apply_manual_theme(self):
+        """Re-resolve theme-dependent colours on surfaces CTk doesn't manage."""
+        if getattr(self, "artwork_label", None) is not None:
+            self.artwork_label.configure(
+                bg=_c(ARTWORK_BG), fg=_c(ARTWORK_PLACEHOLDER_FG)
+            )
+        # Rebuild the cached backdrop so the empty-art colour matches the theme.
+        self._set_artwork(self._artwork_bytes, force=True)
+
     def _populate_devices(self):
         """Trigger a device scan. Runs off the UI thread since re-enumerating WASAPI
         hardware (needed to see newly plugged/unplugged devices) can take a beat."""
@@ -717,7 +789,7 @@ class App:
 
         if self.running:
             self.status_label.configure(
-                text=f"Running — {len(self.device_outputs)} device(s)", text_color="white"
+                text=f"Running — {len(self.device_outputs)} device(s)", text_color=TEXT
             )
 
     # --------------------------------------------------------- live loop --
@@ -769,7 +841,7 @@ class App:
             self._populate_devices()
             if self.running:
                 self.status_label.configure(
-                    text=f"Running — {len(self.device_outputs)} device(s)", text_color="white"
+                    text=f"Running — {len(self.device_outputs)} device(s)", text_color=TEXT
                 )
 
         lowest_buffer_ms = None
@@ -833,7 +905,7 @@ class App:
         self.running = True
         self.status_dot.configure(text_color=GOOD)
         self.status_label.configure(text=f"Running — {len(self.device_outputs)} device(s)",
-                                     text_color="white")
+                                     text_color=TEXT)
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.reset_btn.configure(state="normal")
@@ -944,7 +1016,7 @@ class App:
                 card.enabled_var.set(False)
 
         self.status_label.configure(text=f"Running — {len(self.device_outputs)} device(s)",
-                                     text_color="white")
+                                     text_color=TEXT)
         if failed:
             messagebox.showwarning(
                 "Device unavailable",
@@ -998,7 +1070,7 @@ class App:
         self._auto_reset_handle = None
         self._auto_reset_pending = False
         self._reset_adaptive_delays()
-        self.status_label.configure(text=f"Running — {len(self.device_outputs)} device(s)", text_color="white")
+        self.status_label.configure(text=f"Running — {len(self.device_outputs)} device(s)", text_color=TEXT)
 
     @staticmethod
     def _format_media_time(value):
@@ -1040,9 +1112,9 @@ class App:
         if Image is None or ImageTk is None:
             return
 
-        # No artwork: use a flat dark backdrop so the bars still have a stage.
+        # No artwork: use a flat themed backdrop so the bars still have a stage.
         if not thumbnail_bytes:
-            self._art_bg = Image.new("RGB", target, (22, 25, 35))
+            self._art_bg = Image.new("RGB", target, _c(ARTWORK_EMPTY_RGB))
             self._art_fg = None
             self._art_fg_offset = (0, 0)
             self._bar_colors = None
@@ -1079,7 +1151,7 @@ class App:
                 self._bar_colors = self._make_bar_colors(self._palette_from_image(artwork))
             self._composite_artwork()
         except Exception:
-            self._art_bg = Image.new("RGB", target, (22, 25, 35))
+            self._art_bg = Image.new("RGB", target, _c(ARTWORK_EMPTY_RGB))
             self._art_fg = None
             self._art_fg_offset = (0, 0)
             self._bar_colors = None
@@ -1219,7 +1291,7 @@ class App:
 
     def _fetch_artwork(self, expected_key):
         controller = MediaController()
-        current = controller.get_current_track(include_thumbnail=True)
+        current = controller.get_current_track(include_thumbnail=True) if controller.winrt_available else None
         thumbnail = current.get("thumbnail") if current and current.get("art_key") == expected_key else None
         self._artwork_results.put((expected_key, thumbnail))
 
@@ -1421,7 +1493,22 @@ class App:
 
 
 def main():
+    # Frozen exes re-run this entry point in every spawned child; without this a
+    # multiprocessing child would relaunch the whole UI, opening windows in a loop.
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    # Give Windows an explicit app id so the taskbar uses our icon, not Python's.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SyncMirror.App")
+    except Exception:
+        pass
+
     root = ctk.CTk()
+    try:
+        root.iconbitmap(ICON_PATH)
+    except Exception:
+        pass
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
