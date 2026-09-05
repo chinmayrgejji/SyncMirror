@@ -9,9 +9,10 @@ hiddenimports = [
     "winrt.windows.devices.enumeration",
     "winrt.windows.media.devices",
     "winrt.windows.foundation",
+    "webremote",
 ]
 
-for pkg in ("customtkinter", "pyaudiowpatch", "winrt"):
+for pkg in ("customtkinter", "pyaudiowpatch", "winrt", "pystray", "flask", "werkzeug", "jinja2", "qrcode"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

@@ -39,6 +39,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 [Files]
 ; Bundle the entire PyInstaller onedir output.
 Source: "dist\SyncMirror\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Also place the icon at the app root so shortcuts can reference a stable path.
+Source: "SyncMirror.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; IconFilename: "{app}\SyncMirror.ico"

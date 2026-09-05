@@ -22,6 +22,7 @@ import asyncio
 import ctypes
 from datetime import datetime, timezone
 from io import BytesIO
+import json
 import queue
 import tkinter as tk
 import threading
@@ -39,6 +40,16 @@ except ImportError:
     ImageFilter = None
     ImageOps = None
     ImageTk = None
+
+try:
+    import pystray
+except ImportError:
+    pystray = None
+
+try:
+    from webremote import WebRemote
+except ImportError:
+    WebRemote = None
 
 from ring_buffer import SyncRingBuffer
 from capture import LoopbackCapture
@@ -124,6 +135,50 @@ def resource_path(relative):
 
 
 ICON_PATH = resource_path("SyncMirror.ico")
+
+
+def settings_path():
+    """Per-user settings file, kept out of the (read-only when installed) app dir."""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "SyncMirror")
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(folder, "settings.json")
+
+
+class SettingsStore:
+    """Persists per-device delay/volume/mute/enabled across launches, keyed by the
+    device's friendly name (stable across reconnects)."""
+
+    def __init__(self):
+        self.path = settings_path()
+        self.devices = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("devices"), dict):
+                self.devices = data["devices"]
+        except (OSError, ValueError):
+            self.devices = {}
+
+    def get(self, name):
+        entry = self.devices.get(name)
+        return entry if isinstance(entry, dict) else None
+
+    def update(self, name, **fields):
+        self.devices.setdefault(name, {}).update(fields)
+
+    def save(self):
+        # Atomic write so a crash mid-save can't corrupt the settings file.
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"devices": self.devices}, f, indent=2)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
 
 class MediaController:
@@ -226,15 +281,18 @@ class MediaController:
 class DeviceCard(ctk.CTkFrame):
     """One row per audio output device: enable toggle, delay control, live buffer meter."""
 
-    def __init__(self, master, info, on_toggle, on_delay_change):
+    def __init__(self, master, info, on_toggle, on_delay_change, on_volume_change):
         super().__init__(master, fg_color=CARD_BG, corner_radius=10,
                          border_width=1, border_color=BORDER)
         self.info = info
         self.on_toggle = on_toggle
         self.on_delay_change = on_delay_change
+        self.on_volume_change = on_volume_change
 
         self.enabled_var = tk.BooleanVar(value=False)
         self.delay_var = tk.DoubleVar(value=0.0)
+        self.volume_var = tk.DoubleVar(value=100.0)
+        self.muted_var = tk.BooleanVar(value=False)
 
         self.grid_columnconfigure(0, weight=1)
 
@@ -280,9 +338,90 @@ class DeviceCard(ctk.CTkFrame):
                                         font=ctk.CTkFont(size=FS_LABEL, weight="bold"))
         self.delay_label.grid(row=0, column=4, sticky="e")
 
+        # -- volume row: level slider + value + mute --
+        vol_row = ctk.CTkFrame(self, fg_color="transparent")
+        vol_row.grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=PAD_M,
+            pady=(0, PAD_S),
+        )
+
+        # Layout:
+        # VOLUME | slider ---------------- | 100% | mute
+        vol_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            vol_row,
+            text="VOLUME",
+            text_color=TEXT_FAINT,
+            width=52,
+            anchor="w",
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=(0, PAD_M),
+        )
+
+        self.volume_slider = ctk.CTkSlider(
+            vol_row,
+            from_=0,
+            to=100,
+            variable=self.volume_var,
+            command=self._volume_changed,
+            progress_color=ACCENT,
+            button_color=ACCENT,
+            button_hover_color=ACCENT_HOVER,
+            height=14,
+        )
+        self.volume_slider.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+        )
+
+        self.volume_label = ctk.CTkLabel(
+            vol_row,
+            text="100%",
+            width=48,
+            anchor="e",
+            text_color=TEXT,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        )
+        self.volume_label.grid(
+            row=0,
+            column=2,
+            sticky="e",
+            padx=(PAD_M, PAD_S),
+        )
+
+        self.mute_btn = ctk.CTkButton(
+            vol_row,
+            text="\U0001F50A",
+            width=32,
+            height=30,
+            corner_radius=8,
+            fg_color="transparent",
+            hover_color=CARD_HI,
+            border_width=1,
+            border_color=BORDER,
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=FS_BODY),
+            command=self._toggle_mute,
+        )
+        self.mute_btn.grid(
+            row=0,
+            column=3,
+            sticky="e",
+        )
+
+
         # -- buffer meter with the stutter state folded in as a badge --
         meter_row = ctk.CTkFrame(self, fg_color="transparent")
-        meter_row.grid(row=2, column=0, sticky="ew", padx=PAD_M, pady=(0, PAD_M))
+        meter_row.grid(row=3, column=0, sticky="ew", padx=PAD_M, pady=(0, PAD_M))
         meter_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(meter_row, text="BUFFER", text_color=TEXT_FAINT, width=44, anchor="w",
@@ -325,6 +464,52 @@ class DeviceCard(ctk.CTkFrame):
         new_val = max(DELAY_MIN, min(DELAY_MAX, self.delay_var.get() + delta))
         self.delay_var.set(new_val)
         self._delay_changed(new_val)
+
+    def effective_volume(self):
+        """Linear gain (0.0-1.0) the output should apply: 0 while muted."""
+        if self.muted_var.get():
+            return 0.0
+        return self.volume_var.get() / 100.0
+
+    def _volume_changed(self, value):
+        # Dragging the slider up while muted is treated as an intent to unmute.
+        if self.muted_var.get() and float(value) > 0:
+            self.muted_var.set(False)
+            self._refresh_mute_button()
+        self.volume_label.configure(text=f"{int(float(value))}%")
+        self.on_volume_change(self.info["name"], self.effective_volume())
+
+    def _toggle_mute(self):
+        self.muted_var.set(not self.muted_var.get())
+        self._refresh_mute_button()
+        self.on_volume_change(self.info["name"], self.effective_volume())
+
+    def set_muted(self, muted):
+        """Set mute to an explicit state (used by the web remote)."""
+        if bool(muted) != self.muted_var.get():
+            self._toggle_mute()
+
+    def _refresh_mute_button(self):
+        if self.muted_var.get():
+            self.mute_btn.configure(text="\U0001F507", text_color=BAD)
+        else:
+            self.mute_btn.configure(text="\U0001F50A", text_color=TEXT_DIM)
+
+    def apply_saved(self, delay=None, volume=None, muted=None, enabled=None):
+        """Restore persisted settings onto the widgets WITHOUT firing the change
+        callbacks (setting a var directly doesn't trigger a slider/switch command),
+        so restoring doesn't cause spurious writes back to the store."""
+        if delay is not None:
+            self.delay_var.set(float(delay))
+            self.delay_label.configure(text=f"{int(float(delay))} ms")
+        if volume is not None:
+            self.volume_var.set(float(volume))
+            self.volume_label.configure(text=f"{int(float(volume))}%")
+        if muted is not None:
+            self.muted_var.set(bool(muted))
+            self._refresh_mute_button()
+        if enabled is not None:
+            self.enabled_var.set(bool(enabled))
 
     def update_live_stats(self, buffer_ms, stutter_count, active: bool):
         if not active:
@@ -479,6 +664,12 @@ class App:
         self._timeline_playing = False
         self._timeline_track_key = None
         self._last_track_seen_at = 0.0
+        self.tray_icon = None
+        self._tray_state_sig = None
+        self.settings = SettingsStore()
+        self._settings_save_handle = None
+        self.web_remote = None
+        self.web_command_queue = queue.Queue()
 
         self._build_ui()
         self._populate_devices()
@@ -490,6 +681,9 @@ class App:
         self._tick_playback_clock()
         if Image is not None:
             self._tick_visualizer()
+        self._build_tray()
+        self._poll_web_commands()
+        self._publish_web_state()
 
     # ------------------------------------------------------------- UI --
 
@@ -571,6 +765,12 @@ class App:
                                             width=98)
         self.reset_btn.configure(state="disabled")
         self.reset_btn.pack(side="left", padx=(PAD_S, 0))
+
+        self.web_btn = self._ghost_button(btn_row, "Web Remote", self._toggle_web_remote,
+                                          width=110)
+        if WebRemote is None:
+            self.web_btn.configure(state="disabled")
+        self.web_btn.pack(side="right")
 
         src_row = ctk.CTkFrame(controls, fg_color=CARD_HI, corner_radius=8)
         src_row.pack(fill="x", padx=PAD_M, pady=(0, PAD_M))
@@ -775,7 +975,14 @@ class App:
                 self.cards[name].info = info
             else:
                 card = DeviceCard(self.devices_frame, info,
-                                 on_toggle=self._on_toggle, on_delay_change=self._on_delay_change)
+                                 on_toggle=self._on_toggle, on_delay_change=self._on_delay_change,
+                                 on_volume_change=self._on_volume_change)
+                saved = self.settings.get(name)
+                if saved:
+                    card.apply_saved(
+                        delay=saved.get("delay"), volume=saved.get("volume"),
+                        muted=saved.get("muted"), enabled=saved.get("enabled"),
+                    )
                 card.pack(fill="x", pady=6)
                 self.cards[name] = card
 
@@ -894,7 +1101,7 @@ class App:
                     card.info["name"], card.info, self.ring_buffer,
                     base_safety_ms=BASE_SAFETY_MS,
                     user_delay_ms=card.delay_var.get() + self.source_delay.get(),
-                    volume=1.0,
+                    volume=card.effective_volume(),
                 )
                 out.start()
                 self.device_outputs[idx] = out
@@ -937,6 +1144,7 @@ class App:
             card.update_live_stats(0, 0, active=False)
 
     def _on_toggle(self, device_index, enabled):
+        self._record_device_settings(device_index)
         if not self.running:
             return
 
@@ -952,7 +1160,7 @@ class App:
                     card.info["name"], card.info, self.ring_buffer,
                     base_safety_ms=BASE_SAFETY_MS,
                     user_delay_ms=card.delay_var.get() + self.source_delay.get(),
-                    volume=1.0,
+                    volume=card.effective_volume(),
                 )
                 out.start()
                 self.device_outputs[device_index] = out
@@ -1007,7 +1215,7 @@ class App:
                     name, card.info, self.ring_buffer,
                     base_safety_ms=BASE_SAFETY_MS,
                     user_delay_ms=delays.get(name, 0.0) + self.source_delay.get(),
-                    volume=1.0,
+                    volume=card.effective_volume(),
                 )
                 out.start()
                 self.device_outputs[name] = out
@@ -1027,6 +1235,36 @@ class App:
         out = self.device_outputs.get(device_index)
         if out:
             out.set_user_delay_ms(value + self.source_delay.get())
+        self._record_device_settings(device_index)
+
+    def _on_volume_change(self, device_index, volume):
+        out = self.device_outputs.get(device_index)
+        if out:
+            out.set_volume(volume)
+        self._record_device_settings(device_index)
+
+    def _record_device_settings(self, name):
+        card = self.cards.get(name)
+        if card is None:
+            return
+        self.settings.update(
+            name,
+            delay=card.delay_var.get(),
+            volume=card.volume_var.get(),
+            muted=card.muted_var.get(),
+            enabled=card.enabled_var.get(),
+        )
+        self._schedule_settings_save()
+
+    def _schedule_settings_save(self):
+        # Debounce: dragging a slider fires rapidly, so coalesce into one disk write.
+        if self._settings_save_handle is not None:
+            self.root.after_cancel(self._settings_save_handle)
+        self._settings_save_handle = self.root.after(600, self._save_settings_now)
+
+    def _save_settings_now(self):
+        self._settings_save_handle = None
+        self.settings.save()
 
     def _change_source_delay(self, delta_ms):
         new_val = max(DELAY_MIN, min(DELAY_MAX, self.source_delay.get() + delta_ms))
@@ -1107,6 +1345,8 @@ class App:
         if thumbnail_bytes == self._artwork_bytes and not force:
             return
         self._artwork_bytes = thumbnail_bytes
+        if self.web_remote is not None:
+            self.web_remote.set_artwork(thumbnail_bytes)
         target = (self._artwork_width, self._artwork_height)
 
         if Image is None or ImageTk is None:
@@ -1484,11 +1724,654 @@ class App:
         for idx, out in self.device_outputs.items():
             out.reader.clear_adaptive_delay()
 
-    def on_close(self):
+    # --------------------------------------------------------- tray --
+
+    def _build_tray(self):
+        """Run a Windows system-tray icon in a background thread. Its menu callbacks
+        fire on pystray's thread, so each one hops back onto Tk via root.after."""
+        if pystray is None or Image is None:
+            return
+        try:
+            image = Image.open(ICON_PATH)
+        except Exception:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem("SyncMirror", None, enabled=False),
+            pystray.MenuItem(self._tray_status_text, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Show SyncMirror", self._tray_show, default=True),
+            pystray.MenuItem(
+                lambda item: "Stop Sync" if self.running else "Start Sync",
+                self._tray_toggle_sync,
+            ),
+            pystray.MenuItem("Reset Sync", self._tray_reset,
+                             enabled=lambda item: self.running),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit SyncMirror", self._tray_quit),
+        )
+        self.tray_icon = pystray.Icon("SyncMirror", image, "SyncMirror", menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self._tick_tray()
+
+    def _tick_tray(self):
+        # pystray caches the menu; the dynamic labels only re-read their callables
+        # when update_menu() is called, so poll for state changes and refresh then.
+        if self.tray_icon is not None:
+            sig = (self.running, len(self.device_outputs))
+            if sig != self._tray_state_sig:
+                self._tray_state_sig = sig
+                try:
+                    self.tray_icon.update_menu()
+                except Exception:
+                    pass
+        self.root.after(500, self._tick_tray)
+
+    def _tray_status_text(self, item=None):
+        # Re-evaluated each time the menu opens (pystray calls the text callable).
+        if self.running:
+            n = len(self.device_outputs)
+            return f"\u25cf  {n} device(s) connected"
+        return "\u25cb  Stopped"
+
+    def _tray_show(self, icon=None, item=None):
+        self.root.after(0, self._show_window)
+
+    def _show_window(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _tray_toggle_sync(self, icon=None, item=None):
+        self.root.after(0, self._toggle_sync)
+
+    def _toggle_sync(self):
         if self.running:
             self.stop_sync()
+        else:
+            self.start_sync()
+
+    def _tray_reset(self, icon=None, item=None):
+        self.root.after(0, self._reset_adaptive_delays)
+
+    def _tray_quit(self, icon=None, item=None):
+        self.root.after(0, self._shutdown)
+
+    # --------------------------------------------------------- web remote --
+
+    def _toggle_web_remote(self):
+        if WebRemote is None:
+            return
+        if self.web_remote is not None:
+            self.web_remote.stop()
+            self.web_remote = None
+            self.web_btn.configure(text="Web Remote")
+            return
+        try:
+            self.web_remote = WebRemote(self.web_command_queue)
+            self.web_remote.start()
+            self.web_remote.set_artwork(self._artwork_bytes)
+        except Exception as exc:
+            self.web_remote = None
+            messagebox.showerror("Web remote", f"Could not start server:\n{exc}")
+            return
+        self.web_btn.configure(text="Web Remote: ON")
+        url = f"http://{self.web_remote.local_ip()}:{self.web_remote.port}"
+        self._show_web_dialog(url, self.web_remote.token)
+
+    def _show_web_dialog(self, url, pin):
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title("Web Remote")
+        dlg.configure(fg_color=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+
+        # CustomTkinter needs the icon set after the window is realised.
+        dlg.after(220, lambda: self._safe_iconbitmap(dlg))
+
+        # QR contains the token, so scanning it connects automatically.
+        login_url = f"{url}/?token={pin}"
+
+        # ------------------------------------------------------------------
+        # Main card
+        # ------------------------------------------------------------------
+        card = ctk.CTkFrame(
+            dlg,
+            fg_color=CARD_BG,
+            corner_radius=16,
+            border_width=1,
+            border_color=BORDER,
+        )
+        card.pack(
+            padx=PAD_M,
+            pady=PAD_M,
+            fill="both",
+            expand=True,
+        )
+
+        # ------------------------------------------------------------------
+        # Header
+        # ------------------------------------------------------------------
+        header = ctk.CTkFrame(
+            card,
+            fg_color="transparent",
+        )
+        header.pack(
+            fill="x",
+            padx=PAD_L,
+            pady=(PAD_L, PAD_S),
+        )
+
+        # Status dot
+        ctk.CTkLabel(
+            header,
+            text="●",
+            text_color=GOOD,
+            font=ctk.CTkFont(size=16),
+            width=18,
+        ).pack(
+            side="left",
+            padx=(0, PAD_XS),
+        )
+
+        header_text = ctk.CTkFrame(
+            header,
+            fg_color="transparent",
+        )
+        header_text.pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+
+        ctk.CTkLabel(
+            header_text,
+            text="Web Remote",
+            text_color=TEXT,
+            anchor="w",
+            font=ctk.CTkFont(
+                size=FS_TITLE,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+        )
+
+        ctk.CTkLabel(
+            header_text,
+            text="Control SyncMirror from your phone",
+            text_color=TEXT_DIM,
+            anchor="w",
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+            ),
+        ).pack(
+            anchor="w",
+            pady=(1, 0),
+        )
+
+        # ------------------------------------------------------------------
+        # Main content
+        # ------------------------------------------------------------------
+        content = ctk.CTkFrame(
+            card,
+            fg_color="transparent",
+        )
+        content.pack(
+            fill="both",
+            expand=True,
+            padx=PAD_L,
+            pady=PAD_S,
+        )
+
+        content.grid_columnconfigure(0, weight=0)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        # ------------------------------------------------------------------
+        # QR section
+        # ------------------------------------------------------------------
+        qr_section = ctk.CTkFrame(
+            content,
+            fg_color=CARD_HI,
+            corner_radius=12,
+            border_width=1,
+            border_color=BORDER,
+        )
+        qr_section.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+            padx=(0, PAD_M),
+        )
+
+        ctk.CTkLabel(
+            qr_section,
+            text="SCAN TO CONNECT",
+            text_color=TEXT_FAINT,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+                weight="bold",
+            ),
+        ).pack(
+            pady=(PAD_M, PAD_S),
+        )
+
+        qr_image = self._make_qr_image(
+            login_url,
+            size=190,
+        )
+
+        if qr_image is not None:
+            qr_panel = ctk.CTkFrame(
+                qr_section,
+                fg_color="#ffffff",
+                corner_radius=10,
+            )
+            qr_panel.pack(
+                padx=PAD_M,
+                pady=(0, PAD_S),
+            )
+
+            ctk.CTkLabel(
+                qr_panel,
+                text="",
+                image=qr_image,
+            ).pack(
+                padx=8,
+                pady=8,
+            )
+
+            self._web_qr_image = qr_image
+
+            ctk.CTkLabel(
+                qr_section,
+                text="Scan with your phone camera",
+                text_color=TEXT_DIM,
+                font=ctk.CTkFont(
+                    size=FS_LABEL,
+                ),
+            ).pack(
+                pady=(0, PAD_M),
+            )
+        else:
+            ctk.CTkLabel(
+                qr_section,
+                text="QR code unavailable",
+                text_color=TEXT_DIM,
+                font=ctk.CTkFont(size=FS_BODY),
+            ).pack(
+                padx=PAD_L,
+                pady=PAD_L,
+            )
+
+        # ------------------------------------------------------------------
+        # Connection details section
+        # ------------------------------------------------------------------
+        details = ctk.CTkFrame(
+            content,
+            fg_color="transparent",
+        )
+        details.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
+        )
+
+        # -- Connection status --
+        status_card = ctk.CTkFrame(
+            details,
+            fg_color=CARD_HI,
+            corner_radius=10,
+        )
+        status_card.pack(
+            fill="x",
+            pady=(0, PAD_S),
+        )
+
+        ctk.CTkLabel(
+            status_card,
+            text="STATUS",
+            text_color=TEXT_FAINT,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=PAD_M,
+            pady=(PAD_M, 2),
+        )
+
+        ctk.CTkLabel(
+            status_card,
+            text="●  Remote server active",
+            text_color=GOOD,
+            anchor="w",
+            font=ctk.CTkFont(
+                size=FS_BODY,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=PAD_M,
+            pady=(0, PAD_M),
+        )
+
+        # -- Address --
+        address_card = ctk.CTkFrame(
+            details,
+            fg_color=CARD_HI,
+            corner_radius=10,
+        )
+        address_card.pack(
+            fill="x",
+            pady=(0, PAD_S),
+        )
+
+        ctk.CTkLabel(
+            address_card,
+            text="ADDRESS",
+            text_color=TEXT_FAINT,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=PAD_M,
+            pady=(PAD_M, 2),
+        )
+
+        address_row = ctk.CTkFrame(
+            address_card,
+            fg_color="transparent",
+        )
+        address_row.pack(
+            fill="x",
+            padx=PAD_M,
+            pady=(0, PAD_M),
+        )
+
+        ctk.CTkLabel(
+            address_row,
+            text=url,
+            text_color=ACCENT,
+            anchor="w",
+            font=ctk.CTkFont(
+                size=FS_BODY,
+                weight="bold",
+            ),
+        ).pack(
+            side="left",
+            fill="x",
+            expand=True,
+        )
+
+        ctk.CTkButton(
+            address_row,
+            text="Copy",
+            width=58,
+            height=28,
+            corner_radius=6,
+            fg_color="transparent",
+            hover_color=CARD_BG,
+            border_width=1,
+            border_color=BORDER,
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+                weight="bold",
+            ),
+            command=lambda: self._copy_to_clipboard(url),
+        ).pack(
+            side="right",
+            padx=(PAD_S, 0),
+        )
+
+        # -- PIN --
+        pin_card = ctk.CTkFrame(
+            details,
+            fg_color=CARD_HI,
+            corner_radius=10,
+        )
+        pin_card.pack(
+            fill="x",
+        )
+
+        ctk.CTkLabel(
+            pin_card,
+            text="ACCESS PIN",
+            text_color=TEXT_FAINT,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=PAD_M,
+            pady=(PAD_M, 0),
+        )
+
+        ctk.CTkLabel(
+            pin_card,
+            text=str(pin),
+            text_color=TEXT,
+            font=ctk.CTkFont(
+                size=FS_DISPLAY,
+                weight="bold",
+            ),
+        ).pack(
+            anchor="w",
+            padx=PAD_M,
+            pady=(0, PAD_M),
+        )
+
+        # ------------------------------------------------------------------
+        # Footer
+        # ------------------------------------------------------------------
+        footer = ctk.CTkFrame(
+            card,
+            fg_color="transparent",
+        )
+        footer.pack(
+            fill="x",
+            padx=PAD_L,
+            pady=(PAD_S, PAD_L),
+        )
+
+        ctk.CTkLabel(
+            footer,
+            text="Phone and computer must be on the same Wi-Fi network.",
+            text_color=TEXT_DIM,
+            font=ctk.CTkFont(
+                size=FS_LABEL,
+            ),
+        ).pack(
+            side="left",
+        )
+
+        ctk.CTkButton(
+            footer,
+            text="Done",
+            width=90,
+            height=34,
+            corner_radius=8,
+            fg_color=ACCENT,
+            hover_color=ACCENT_HOVER,
+            font=ctk.CTkFont(
+                size=FS_BODY,
+                weight="bold",
+            ),
+            command=dlg.destroy,
+        ).pack(
+            side="right",
+        )
+
+        # ------------------------------------------------------------------
+        # Finalise / centre
+        # ------------------------------------------------------------------
+        dlg.update_idletasks()
+        self._center_over_root(dlg)
+        dlg.grab_set()
+
+    def _make_qr_image(self, data, size=190):
+        try:
+            import qrcode
+        except Exception:
+            return None
+        try:
+            qr = qrcode.QRCode(border=2, box_size=10,
+                               error_correction=qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(data)
+            qr.make(fit=True)
+            pil = qr.make_image(fill_color="#101319", back_color="#ffffff").convert("RGB")
+            return ctk.CTkImage(light_image=pil, dark_image=pil, size=(size, size))
+        except Exception:
+            return None
+
+    def _safe_iconbitmap(self, window):
+        try:
+            window.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+    def _copy_to_clipboard(self, text):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except Exception:
+            pass
+
+    def _center_over_root(self, window):
+        try:
+            self.root.update_idletasks()
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            ww, wh = window.winfo_width(), window.winfo_height()
+            x = rx + (rw - ww) // 2
+            y = ry + (rh - wh) // 3
+            window.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        except Exception:
+            pass
+
+    def _poll_web_commands(self):
+        try:
+            while True:
+                self._handle_web_command(self.web_command_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_web_commands)
+
+    def _handle_web_command(self, cmd):
+        action = cmd.get("action")
+        try:
+            if action == "toggle_sync":
+                self._toggle_sync()
+            elif action == "start":
+                self.start_sync()
+            elif action == "stop":
+                self.stop_sync()
+            elif action == "set_source_delay":
+                self._set_source_delay(float(cmd.get("value", 0)))
+            elif action == "media":
+                which = cmd.get("which")
+                if which == "play_pause":
+                    self._media_play_pause()
+                elif which == "next":
+                    self._media_next()
+                elif which == "previous":
+                    self._media_previous()
+            elif action == "set_delay":
+                card = self.cards.get(cmd.get("name"))
+                if card:
+                    d = max(DELAY_MIN, min(DELAY_MAX, float(cmd.get("delay", 0))))
+                    card.delay_var.set(d)
+                    card._delay_changed(d)
+            elif action == "set_volume":
+                card = self.cards.get(cmd.get("name"))
+                if card:
+                    v = max(0.0, min(100.0, float(cmd.get("volume", 100))))
+                    card.volume_var.set(v)
+                    card._volume_changed(v)
+            elif action == "set_muted":
+                card = self.cards.get(cmd.get("name"))
+                if card:
+                    card.set_muted(bool(cmd.get("muted")))
+            elif action == "toggle_device":
+                card = self.cards.get(cmd.get("name"))
+                if card:
+                    card.enabled_var.set(bool(cmd.get("enabled")))
+                    card._toggled()
+        except Exception as exc:
+            print(f"[SyncMirror] web command error: {exc}", flush=True)
+
+    def _publish_web_state(self):
+        # Built on the Tk thread (safe to read widgets) then handed to the server.
+        if self.web_remote is not None:
+            devices = []
+            for name, card in self.cards.items():
+                devices.append({
+                    "name": name,
+                    "enabled": bool(card.enabled_var.get()),
+                    "active": name in self.device_outputs,
+                    "delay": round(card.delay_var.get(), 1),
+                    "volume": round(card.volume_var.get()),
+                    "muted": bool(card.muted_var.get()),
+                })
+            position = self._timeline_position_seconds
+            if position is not None and self._timeline_playing:
+                position += time.monotonic() - self._timeline_anchor
+            now_playing = {
+                "title": self.track_name_label.cget("text"),
+                "artist": self.track_artist_label.cget("text"),
+                "meta": self.track_meta_label.cget("text"),
+                "position": position,
+                "duration": self._timeline_duration_seconds,
+                "playing": bool(self._timeline_playing),
+            }
+            self.web_remote.set_state({
+                "running": self.running,
+                "source_delay": self.source_delay.get(),
+                "now_playing": now_playing,
+                "devices": devices,
+            })
+        self.root.after(700, self._publish_web_state)
+
+    def _set_source_delay(self, value):
+        new_val = max(DELAY_MIN, min(DELAY_MAX, value))
+        self.source_delay.set(new_val)
+        self.source_delay_label.configure(text=f"{int(new_val)} ms")
+        for idx, out in self.device_outputs.items():
+            card = self.cards.get(idx)
+            if card:
+                out.set_user_delay_ms(card.delay_var.get() + new_val)
+
+    def on_close(self):
+        # With a tray icon present, the window's close button just hides to the
+        # tray; the tray's "Quit" is the real exit. Without a tray, close exits.
+        if self.tray_icon is not None:
+            self.root.withdraw()
+            return
+        self._shutdown()
+
+    def _shutdown(self):
+        if self.running:
+            self.stop_sync()
+        if self.web_remote is not None:
+            self.web_remote.stop()
+            self.web_remote = None
+        if self._settings_save_handle is not None:
+            self.root.after_cancel(self._settings_save_handle)
+            self._settings_save_handle = None
+        self.settings.save()
         self.endpoint_watcher.stop()
         self.capture.close()
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.root.destroy()
 
 
