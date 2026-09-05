@@ -37,6 +37,18 @@ Windows.
 - **Live audio visualizer** — an FFT-driven equalizer rendered behind the album
   art (blurred artwork backdrop → reactive spectrum bars → sharp thumbnail), with
   the bars automatically tinted to match the current cover's color palette.
+- **Per-device volume + mute** — balance loudness between devices and mute any
+  device independently, without affecting the others.
+- **Phone/web remote** — an optional PIN-protected mobile web page (a tiny Flask
+  server on your LAN) to control playback, sync, per-device delay/volume/mute,
+  and see the now-playing track + album art from your phone. Scan the QR code in
+  the app to connect and log in instantly — no typing the PIN.
+- **System tray** — minimize to the tray with a live status (running / device
+  count) and quick Start/Stop/Reset/Show/Quit actions.
+- **Persisted per-device settings** — each device's delay, volume, mute, and
+  enabled state are saved (keyed by device name) to
+  `%APPDATA%\SyncMirror\settings.json` and restored automatically, so you don't
+  re-tune the sliders every launch.
 - **Consistent output quality** across all devices through WASAPI shared mode.
 - Per-device stutter logging to `stutter_logs/` for diagnosing sync issues.
 
@@ -66,18 +78,34 @@ python app.py
 5. Use **Volume** to balance loudness differences between devices.
 6. Use **Reset Sync** to clear accumulated adaptive delay if a device drifts
    after a track change.
+7. Click **Web Remote** to start the phone remote, then scan the QR code (or
+   open the shown URL and enter the PIN) from a phone on the same Wi-Fi.
+
+## Install as an app
+
+To install SyncMirror as a normal Windows app (Start menu + desktop shortcut,
+no need to run the raw exe each time):
+
+```powershell
+# 1. Build the app bundle and the shareable installer
+powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
+
+# 2. Run the generated installer
+.\Output\SyncMirror-Setup.exe
+```
+
+The installer is per-user (no admin prompt) and installs to
+`%LOCALAPPDATA%\Programs\SyncMirror`. See [BUILD_EXE.md](BUILD_EXE.md) for the
+full build/packaging reference.
 
 ## What to build next
 
-- **System tray + light theme** (`pystray` + `customtkinter`).
 - **Auto-delay calibration**: play a short test click, record it back via a
   phone/mic, and auto-measure each device's actual latency instead of tuning
   the sliders by ear. Biggest quality-of-life upgrade left.
 - **Auto-resume** a device when it reconnects mid-session (disconnect handling
   is already instant; the missing half is re-adding it automatically once it
   comes back).
-- **Persisted per-device settings** (save each device's calibrated
-  delay/volume to disk, keyed by device name).
 - **Exclusive-mode option** to trade cross-device consistency for a few ms less
   latency on a specific device.
 - Offload resampling to a per-device worker to further reduce CPU-driven
@@ -90,8 +118,13 @@ src/
   ring_buffer.py            # the core: shared, sample-indexed circular buffer + per-device delay/drift logic
   capture.py                # WASAPI loopback capture -> ring buffer; subprocess-based device enumeration
   output.py                 # per-device WASAPI shared-mode output <- ring buffer; disconnect self-detection
-  app.py                    # customtkinter UI, live device list, now-playing panel, disconnect watcher
+  app.py                    # customtkinter UI, live device list, now-playing panel, tray, persistence, disconnect watcher
+  webremote.py              # optional PIN-protected Flask phone/web remote (state snapshot + command queue)
   check_media_metadata.py   # helper for inspecting GlobalSystemMediaTransportControls metadata
 stutter_logs/               # per-device stutter logs written at runtime
 tests/
+SyncMirror.spec             # PyInstaller build recipe (onedir)
+SyncMirror.iss              # Inno Setup installer script
+build_installer.ps1         # build the app bundle + compile the installer
+install.ps1                 # per-user install straight from dist\ (no installer exe)
 ```
