@@ -11,11 +11,19 @@ widgets or the audio engine directly. Instead it
 This keeps everything single-threaded where it matters.
 """
 
+import json
 import secrets
 import socket
 import threading
 
 from flask import Flask, Response, jsonify, request
+
+# Commands the page is allowed to send; anything else is rejected so the API
+# can confirm what it actually applied instead of blindly returning ok.
+KNOWN_ACTIONS = {
+    "toggle_sync", "start", "stop", "set_source_delay", "media",
+    "set_delay", "set_volume", "set_muted", "toggle_device",
+}
 
 
 class WebRemote:
@@ -27,6 +35,10 @@ class WebRemote:
         self._state = {"running": False, "source_delay": 0.0,
                        "now_playing": None, "devices": []}
         self._state_lock = threading.Lock()
+        # A Condition over the same lock lets SSE clients block until the state
+        # actually changes instead of polling on a timer.
+        self._state_cond = threading.Condition(self._state_lock)
+        self._state_version = 0
         # Latest album-art bytes plus a version that bumps on every change so the
         # page only re-fetches the image when the track (art) actually changes.
         self._art_bytes = None
@@ -38,24 +50,35 @@ class WebRemote:
     # -- state shared with the Tk thread --
 
     def set_state(self, state: dict):
-        with self._state_lock:
+        with self._state_cond:
             self._state = state
+            self._state_version += 1
+            self._state_cond.notify_all()
 
     def _get_state(self):
         with self._state_lock:
             return self._state
 
+    def _snapshot(self):
+        """State plus the current art version, under the lock."""
+        with self._state_lock:
+            snap = dict(self._state)
+            snap["art_version"] = self._art_version
+            return snap
+
     def set_artwork(self, data):
         """Publish the current album-art image bytes (or None to clear)."""
-        with self._state_lock:
+        with self._state_cond:
             if data == self._art_bytes:
                 return
             self._art_bytes = data
             self._art_version += 1
+            self._state_version += 1
             if data and data[:8] == b"\x89PNG\r\n\x1a\n":
                 self._art_mime = "image/png"
             else:
                 self._art_mime = "image/jpeg"
+            self._state_cond.notify_all()
 
     # -- server lifecycle --
 
@@ -81,10 +104,43 @@ class WebRemote:
         def state():
             if not self._authorized():
                 return jsonify({"error": "unauthorized"}), 401
-            with self._state_lock:
-                snap = dict(self._state)
-                snap["art_version"] = self._art_version
-            return jsonify(snap)
+            return jsonify(self._snapshot())
+
+        @app.route("/api/events")
+        def events():
+            # Server-Sent Events: push a fresh snapshot the instant state changes
+            # so transport taps and slider moves reflect without a poll delay.
+            if not self._authorized():
+                return jsonify({"error": "unauthorized"}), 401
+
+            def stream():
+                last = -1
+                while True:
+                    with self._state_cond:
+                        if self._state_version == last:
+                            self._state_cond.wait(timeout=20.0)
+                        changed = self._state_version != last
+                        last = self._state_version
+                        snap = dict(self._state)
+                        snap["art_version"] = self._art_version
+                    if changed:
+                        yield "event: state\ndata: " + json.dumps(snap) + "\n\n"
+                    else:
+                        yield ": keep-alive\n\n"  # heartbeat so proxies/clients hold the line
+
+            return Response(stream(), mimetype="text/event-stream",
+                            headers={"Cache-Control": "no-cache",
+                                     "X-Accel-Buffering": "no",
+                                     "Connection": "keep-alive"})
+
+        @app.route("/manifest.webmanifest")
+        def manifest():
+            return Response(MANIFEST_JSON, mimetype="application/manifest+json")
+
+        @app.route("/icon.svg")
+        def icon():
+            return Response(ICON_SVG, mimetype="image/svg+xml",
+                            headers={"Cache-Control": "max-age=86400"})
 
         @app.route("/api/artwork")
         def artwork():
@@ -102,8 +158,14 @@ class WebRemote:
             if not self._authorized():
                 return jsonify({"error": "unauthorized"}), 401
             data = request.get_json(force=True, silent=True) or {}
+            action = data.get("action")
+            if action not in KNOWN_ACTIONS:
+                return jsonify({"ok": False, "error": "unknown_action",
+                                "action": action}), 400
             self.command_queue.put(data)
-            return jsonify({"ok": True})
+            # The command applies on the Tk thread; return the current snapshot so
+            # the page can reconcile its optimistic update (SSE follows shortly).
+            return jsonify({"ok": True, "state": self._snapshot()})
 
         return app
 
@@ -141,11 +203,45 @@ class WebRemote:
             return "127.0.0.1"
 
 
+ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+    '<rect width="192" height="192" rx="42" fill="#101319"/>'
+    '<circle cx="96" cy="96" r="56" fill="none" stroke="#4da3ff" stroke-width="11"/>'
+    '<circle cx="96" cy="96" r="31" fill="none" stroke="#3ecf6e" stroke-width="11"/>'
+    '<circle cx="96" cy="96" r="11" fill="#e8ecf4"/>'
+    '</svg>'
+)
+
+MANIFEST_JSON = json.dumps({
+    "name": "SyncMirror Remote",
+    "short_name": "SyncMirror",
+    "description": "Remote control for SyncMirror",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#101319",
+    "theme_color": "#101319",
+    "icons": [
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml",
+         "purpose": "any maskable"},
+    ],
+})
+
+
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#101319">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SyncMirror">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon.svg">
 <title>SyncMirror Remote</title>
 <style>
   :root {
@@ -155,12 +251,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
   }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   body { margin:0; background:var(--bg); color:var(--text);
-         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  header { padding:16px 18px 10px; display:flex; align-items:center; justify-content:space-between; }
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         padding:env(safe-area-inset-top) env(safe-area-inset-right)
+                 env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  header { padding:16px 18px 10px; display:flex; align-items:center; justify-content:space-between; gap:10px; }
   header h1 { font-size:19px; margin:0; }
+  .hstatus { display:flex; align-items:center; gap:8px; }
   .status { font-size:12px; font-weight:700; color:var(--dim); }
   .dot { color:var(--bad); }
   .dot.on { color:var(--good); }
+  .repill { background:rgba(232,185,59,.16); color:var(--warn); padding:4px 10px;
+            border-radius:20px; font-size:11px; font-weight:700; display:none; }
+  .repill.show { display:inline-block; }
   .tabs { display:flex; gap:8px; padding:0 14px 12px; }
   .tab { flex:1; text-align:center; padding:10px; border-radius:10px; background:var(--card);
          border:1px solid var(--border); color:var(--dim); font-weight:700; font-size:14px; }
@@ -173,7 +275,27 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .label { font-size:11px; font-weight:700; color:var(--faint); letter-spacing:.4px; }
   .name { font-size:15px; font-weight:700; margin-bottom:4px; }
   .val { font-size:12px; font-weight:700; color:var(--text); min-width:52px; text-align:right; }
-  input[type=range] { width:100%; height:26px; accent-color:var(--accent); background:transparent; }
+  .srow { display:flex; align-items:center; gap:10px; margin-top:2px; }
+  .srow input[type=range] { flex:1; }
+  .nudge { width:38px; height:38px; flex:0 0 auto; border-radius:10px; border:1px solid var(--border);
+           background:transparent; color:var(--dim); font-size:20px; font-weight:700; line-height:1; }
+  .nudge:active { background:var(--hi); }
+  input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:30px;
+                      background:
+                        linear-gradient(var(--accent),var(--accent)) no-repeat,
+                        linear-gradient(var(--hi),var(--hi)) no-repeat;
+                      background-size: var(--fill,0%) 6px, 100% 6px;
+                      background-position: left center, left center;
+                      border-radius:3px; }
+  input[type=range]::-webkit-slider-runnable-track { height:6px; background:transparent; border-radius:3px; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; margin-top:-12px;
+                      width:28px; height:28px; border-radius:50%; background:var(--accent);
+                      border:3px solid var(--bg); box-shadow:0 2px 7px rgba(0,0,0,.45); }
+  input[type=range]::-moz-range-track { height:6px; background:var(--hi); border-radius:3px; }
+  input[type=range]::-moz-range-progress { height:6px; background:var(--accent); border-radius:3px; }
+  input[type=range]::-moz-range-thumb { width:26px; height:26px; border:3px solid var(--bg);
+                      border-radius:50%; background:var(--accent); }
+  svg.ic { width:1em; height:1em; display:block; fill:currentColor; }
   button.btn { border:none; border-radius:10px; padding:12px 16px; font-weight:700; font-size:14px; color:#fff; }
   .primary { background:var(--good); } .danger { background:var(--bad); }
   .ghost { background:transparent; border:1px solid var(--border); color:var(--dim); }
@@ -189,10 +311,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
                background:#fff; transition:left .15s; }
   .sw.on::after { left:22px; }
   .transport { display:flex; align-items:center; justify-content:center; gap:24px; padding:10px 0 2px; }
-  .tbtn { width:54px; height:54px; border-radius:50%; border:none; background:var(--hi); color:var(--text); font-size:20px; }
-  .tbtn.play { width:64px; height:64px; background:var(--accent); color:#06121f; font-size:24px; }
-  .pauseico { display:inline-flex; gap:6px; align-items:center; justify-content:center; }
-  .pauseico i { width:6px; height:22px; border-radius:2px; background:currentColor; }
+  .tbtn { width:54px; height:54px; border-radius:50%; border:none; background:var(--hi); color:var(--text);
+          font-size:22px; display:flex; align-items:center; justify-content:center; }
+  .tbtn.play { width:64px; height:64px; background:var(--accent); color:#06121f; font-size:26px; }
+  .muteb svg.ic, .tbtn svg.ic { width:1em; height:1em; }
   .bar { height:5px; border-radius:3px; background:var(--hi); overflow:hidden; margin:10px 0 4px; }
   .bar > i { display:block; height:100%; background:var(--accent); width:0%; }
   .times { display:flex; justify-content:space-between; font-size:11px; color:var(--faint); }
@@ -225,7 +347,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div id="app" style="display:none;">
   <header>
     <h1>SyncMirror</h1>
-    <div class="status"><span id="dot" class="dot">&#9679;</span> <span id="statustext">--</span></div>
+    <div class="hstatus">
+      <span class="repill" id="reconnect">reconnecting…</span>
+      <div class="status"><span id="dot" class="dot">&#9679;</span> <span id="statustext">--</span></div>
+    </div>
   </header>
   <div class="tabs">
     <div class="tab active" data-tab="playback" onclick="showTab('playback')">Playback</div>
@@ -245,9 +370,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <div class="bar"><i id="np-bar"></i></div>
       <div class="times"><span id="np-cur">--:--</span><span id="np-dur">--:--</span></div>
       <div class="transport">
-        <button class="tbtn" onclick="media('previous')">&#9198;</button>
-        <button class="tbtn play" id="playbtn" onclick="media('play_pause')">&#9654;</button>
-        <button class="tbtn" onclick="media('next')">&#9197;</button>
+        <button class="tbtn" onclick="media('previous')" aria-label="Previous"></button>
+        <button class="tbtn play" id="playbtn" onclick="media('play_pause')" aria-label="Play/Pause"></button>
+        <button class="tbtn" onclick="media('next')" aria-label="Next"></button>
       </div>
     </div>
     <div class="card">
@@ -258,8 +383,12 @@ INDEX_HTML = r"""<!DOCTYPE html>
     </div>
     <div class="card">
       <div class="row"><span class="label">GLOBAL SOURCE DELAY</span><span class="val" id="src-val">0 ms</span></div>
-      <input type="range" id="src" min="-500" max="500" step="5" value="0"
-             oninput="srcLabel(this.value)" onchange="setSource(this.value)">
+      <div class="srow">
+        <button class="nudge" onclick="nudgeSrc(-5)" aria-label="Decrease">&#8722;</button>
+        <input type="range" id="src" min="-500" max="500" step="5" value="0"
+               oninput="srcInput(this.value)" onchange="setSource(this.value)">
+        <button class="nudge" onclick="nudgeSrc(5)" aria-label="Increase">+</button>
+      </div>
     </div>
   </div>
 
@@ -273,6 +402,41 @@ INDEX_HTML = r"""<!DOCTYPE html>
 var token = localStorage.getItem("sm_token") || "";
 var activeTab = "playback";
 var dragging = {};   // device name -> true while a slider is being dragged
+var np_state = { pos:null, dur:null, playing:false, anchor:0 };  // for local progress ticking
+
+// Inline SVG icon set (fill/stroke follow the button's currentColor) so glyphs
+// render identically on every phone instead of platform emoji/entities.
+var ICON = {
+  prev:'<svg class="ic" viewBox="0 0 24 24"><path d="M7 6h2.2v12H7zM20 6l-11 6 11 6z"/></svg>',
+  next:'<svg class="ic" viewBox="0 0 24 24"><path d="M14.8 6H17v12h-2.2zM4 6l11 6-11 6z"/></svg>',
+  play:'<svg class="ic" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>',
+  pause:'<svg class="ic" viewBox="0 0 24 24"><rect x="6.5" y="5" width="4" height="14" rx="1"/><rect x="13.5" y="5" width="4" height="14" rx="1"/></svg>',
+  spk:'<svg class="ic" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16 8.5a4 4 0 010 7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  mute:'<svg class="ic" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9l4 6M21 9l-4 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>'
+};
+
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function haptic(ms){ if (navigator.vibrate) { try { navigator.vibrate(ms || 12); } catch(e){} } }
+function fillTrack(el){
+  var mn = parseFloat(el.min), mx = parseFloat(el.max), v = parseFloat(el.value);
+  el.style.setProperty("--fill", (mx > mn ? (v - mn) / (mx - mn) * 100 : 0) + "%");
+}
+
+// Keep the phone awake while the remote is open so the screen doesn't lock mid-session.
+var wakeLock = null;
+function requestWake(){
+  try {
+    if ("wakeLock" in navigator) {
+      navigator.wakeLock.request("screen").then(function(w){ wakeLock = w; }).catch(function(){});
+    }
+  } catch(e){}
+}
+document.addEventListener("visibilitychange", function(){
+  if (document.visibilityState === "visible") requestWake();
+});
+
+function setOnline(){ document.getElementById("reconnect").classList.remove("show"); }
+function setOffline(){ document.getElementById("reconnect").classList.add("show"); }
 
 function api(path, opts) {
   opts = opts || {};
@@ -292,7 +456,8 @@ function doLogin() {
 function showApp() {
   document.getElementById("login").style.display = "none";
   document.getElementById("app").style.display = "block";
-  poll();
+  connect();
+  requestWake();
 }
 function showTab(t) {
   activeTab = t;
@@ -306,38 +471,65 @@ function fmt(s) {
   return m + ":" + (ss<10?"0":"") + ss;
 }
 function srcLabel(v){ document.getElementById("src-val").textContent = Math.round(v) + " ms"; }
+function srcInput(v){ srcLabel(v); fillTrack(document.getElementById("src")); }
+function nudgeSrc(delta){
+  var el = document.getElementById("src");
+  var v = clamp(parseFloat(el.value || 0) + delta, -500, 500);
+  el.value = v; srcInput(v); setSource(v); haptic(8);
+}
 function artError(){
   var stage = document.getElementById("artstage");
   stage.classList.remove("has-art");
   stage.dataset.av = "";
 }
 function setSource(v){ cmd({action:"set_source_delay", value: parseFloat(v)}); }
-function toggleSync(){ cmd({action:"toggle_sync"}); }
-function media(which){ cmd({action:"media", which: which}); }
+function toggleSync(){
+  // Optimistic: flip the button now, let the next state event confirm.
+  var running = document.getElementById("syncbtn").classList.contains("danger");
+  paintSync(!running);
+  haptic();
+  cmd({action:"toggle_sync"});
+}
+function paintSync(running){
+  var sb = document.getElementById("syncbtn");
+  sb.textContent = running ? "Stop Sync" : "Start Sync";
+  sb.className = "btn " + (running ? "danger" : "primary");
+}
+function paintPlay(playing){
+  document.getElementById("playbtn").innerHTML = playing ? ICON.pause : ICON.play;
+}
+function media(which){
+  haptic();
+  if (which === "play_pause") { np_state.playing = !np_state.playing; paintPlay(np_state.playing); }
+  cmd({action:"media", which: which});
+}
 
 function render(st) {
   var dot = document.getElementById("dot");
   dot.className = "dot" + (st.running ? " on" : "");
   document.getElementById("statustext").textContent =
       st.running ? (st.devices.filter(function(d){return d.active;}).length + " device(s)") : "Stopped";
-  var sb = document.getElementById("syncbtn");
-  sb.textContent = st.running ? "Stop Sync" : "Start Sync";
-  sb.className = "btn " + (st.running ? "danger" : "primary");
+  paintSync(st.running);
+
+  var tp = document.querySelectorAll(".transport .tbtn");
+  if (tp.length === 3 && !tp[0].innerHTML) { tp[0].innerHTML = ICON.prev; tp[2].innerHTML = ICON.next; }
 
   var np = st.now_playing || {};
   document.getElementById("np-title").textContent = np.title || "No active track";
   document.getElementById("np-artist").textContent = np.artist || "";
   document.getElementById("np-meta").textContent = np.meta || "";
   var cur = np.position, dur = np.duration;
-  document.getElementById("np-cur").textContent = fmt(cur);
   document.getElementById("np-dur").textContent = fmt(dur);
+  // Snapshot for local ticking so the progress bar advances smoothly between events.
+  np_state.pos = (cur === null || cur === undefined) ? null : cur;
+  np_state.dur = dur || null;
+  np_state.playing = !!np.playing;
+  np_state.anchor = Date.now() / 1000;
+  document.getElementById("np-cur").textContent = fmt(cur);
   document.getElementById("np-bar").style.width = (dur ? Math.min(100, 100*cur/dur) : 0) + "%";
-  // ⏸ while playing (two bars in the button's text color), ▶ while paused.
-  document.getElementById("playbtn").innerHTML = np.playing
-    ? '<span class="pauseico"><i></i><i></i></span>'
-    : "&#9654;";
+  paintPlay(np_state.playing);
 
-  // Album art stage: (re)load only when the art version changes; animate bars while playing.
+  // Album art stage: (re)load only when the art version changes.
   var stage = document.getElementById("artstage");
   var av = st.art_version || 0;
   if (av && np.title) {
@@ -357,7 +549,7 @@ function render(st) {
   stage.classList.toggle("playing", !!np.playing);
 
   var src = document.getElementById("src");
-  if (document.activeElement !== src) { src.value = st.source_delay; srcLabel(st.source_delay); }
+  if (document.activeElement !== src) { src.value = st.source_delay; srcLabel(st.source_delay); fillTrack(src); }
 
   var list = document.getElementById("devlist");
   document.getElementById("dev-empty").style.display = st.devices.length ? "none" : "block";
@@ -371,6 +563,15 @@ function render(st) {
   st.devices.forEach(updateDeviceCard);
 }
 
+// Advance the progress bar locally between server events so it never stutters.
+function tickProgress(){
+  if (!(np_state.playing && np_state.pos !== null && np_state.dur)) return;
+  var p = Math.min(np_state.dur, np_state.pos + (Date.now() / 1000 - np_state.anchor));
+  document.getElementById("np-cur").textContent = fmt(p);
+  document.getElementById("np-bar").style.width = (100 * p / np_state.dur) + "%";
+}
+setInterval(tickProgress, 500);
+
 function esc(s){ return (s||"").replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
 function id(name){ return "d_" + btoa(unescape(encodeURIComponent(name))).replace(/[^a-zA-Z0-9]/g,""); }
 
@@ -382,16 +583,24 @@ function deviceCard(d) {
       '<div class="sw" id="'+k+'_sw" onclick="toggleDev(\''+k+'\')"></div>' +
     '</div>' +
     '<div class="row"><span class="label">DELAY</span><span class="val" id="'+k+'_dv">0 ms</span></div>' +
-    '<input type="range" min="-500" max="500" step="5" id="'+k+'_d" ' +
-      'ontouchstart="dragOn(\''+k+'\')" onmousedown="dragOn(\''+k+'\')" ' +
-      'oninput="dLabel(\''+k+'\',this.value)" onchange="setDelay(\''+k+'\',this.value)">' +
+    '<div class="srow">' +
+      '<button class="nudge" onclick="nudgeDelay(\''+k+'\',-5)">&#8722;</button>' +
+      '<input type="range" min="-500" max="500" step="5" id="'+k+'_d" ' +
+        'ontouchstart="dragOn(\''+k+'\')" onmousedown="dragOn(\''+k+'\')" ' +
+        'oninput="dLabel(\''+k+'\',this.value)" onchange="setDelay(\''+k+'\',this.value)">' +
+      '<button class="nudge" onclick="nudgeDelay(\''+k+'\',5)">+</button>' +
+    '</div>' +
     '<div class="row" style="margin-top:6px;"><span class="label">VOLUME</span>' +
       '<div style="display:flex;align-items:center;gap:10px;">' +
       '<span class="val" id="'+k+'_vv">100%</span>' +
-      '<button class="muteb" id="'+k+'_m" onclick="toggleMute(\''+k+'\')">&#128266;</button></div></div>' +
-    '<input type="range" min="0" max="100" step="1" id="'+k+'_v" ' +
-      'ontouchstart="dragOn(\''+k+'\')" onmousedown="dragOn(\''+k+'\')" ' +
-      'oninput="vLabel(\''+k+'\',this.value)" onchange="setVol(\''+k+'\',this.value)">' +
+      '<button class="muteb" id="'+k+'_m" onclick="toggleMute(\''+k+'\')">'+ICON.spk+'</button></div></div>' +
+    '<div class="srow">' +
+      '<button class="nudge" onclick="nudgeVol(\''+k+'\',-5)">&#8722;</button>' +
+      '<input type="range" min="0" max="100" step="1" id="'+k+'_v" ' +
+        'ontouchstart="dragOn(\''+k+'\')" onmousedown="dragOn(\''+k+'\')" ' +
+        'oninput="vLabel(\''+k+'\',this.value)" onchange="setVol(\''+k+'\',this.value)">' +
+      '<button class="nudge" onclick="nudgeVol(\''+k+'\',5)">+</button>' +
+    '</div>' +
   '</div>';
 }
 
@@ -401,26 +610,71 @@ function updateDeviceCard(d) {
   var k = id(d.name); cardData[k] = d.name;
   var sw = document.getElementById(k+"_sw"); if (sw) sw.className = "sw" + (d.enabled ? " on":"");
   if (!dragging[k]) {
-    var dd = document.getElementById(k+"_d"); if (dd && document.activeElement!==dd){ dd.value = d.delay; document.getElementById(k+"_dv").textContent = Math.round(d.delay)+" ms"; }
-    var vv = document.getElementById(k+"_v"); if (vv && document.activeElement!==vv){ vv.value = d.volume; document.getElementById(k+"_vv").textContent = Math.round(d.volume)+"%"; }
+    var dd = document.getElementById(k+"_d"); if (dd && document.activeElement!==dd){ dd.value = d.delay; document.getElementById(k+"_dv").textContent = Math.round(d.delay)+" ms"; fillTrack(dd); }
+    var vv = document.getElementById(k+"_v"); if (vv && document.activeElement!==vv){ vv.value = d.volume; document.getElementById(k+"_vv").textContent = Math.round(d.volume)+"%"; fillTrack(vv); }
   }
-  var mb = document.getElementById(k+"_m"); if (mb){ mb.className = "muteb"+(d.muted?" on":""); mb.innerHTML = d.muted ? "&#128263;" : "&#128266;"; }
+  var mb = document.getElementById(k+"_m"); if (mb){ mb.className = "muteb"+(d.muted?" on":""); mb.innerHTML = d.muted ? ICON.mute : ICON.spk; }
 }
 
 function dragOn(k){ dragging[k]=true; }
-function dLabel(k,v){ document.getElementById(k+"_dv").textContent = Math.round(v)+" ms"; }
-function vLabel(k,v){ document.getElementById(k+"_vv").textContent = Math.round(v)+"%"; }
+function dLabel(k,v){ document.getElementById(k+"_dv").textContent = Math.round(v)+" ms"; fillTrack(document.getElementById(k+"_d")); }
+function vLabel(k,v){ document.getElementById(k+"_vv").textContent = Math.round(v)+"%"; fillTrack(document.getElementById(k+"_v")); }
 function setDelay(k,v){ dragging[k]=false; cmd({action:"set_delay", name:cardData[k], delay:parseFloat(v)}); }
 function setVol(k,v){ dragging[k]=false; cmd({action:"set_volume", name:cardData[k], volume:parseFloat(v)}); }
-function toggleMute(k){ var mb=document.getElementById(k+"_m"); var on=!mb.classList.contains("on"); cmd({action:"set_muted", name:cardData[k], muted:on}); }
-function toggleDev(k){ var sw=document.getElementById(k+"_sw"); var on=!sw.classList.contains("on"); cmd({action:"toggle_device", name:cardData[k], enabled:on}); }
+function nudgeDelay(k,delta){
+  var el = document.getElementById(k+"_d");
+  var v = clamp(parseFloat(el.value || 0) + delta, -500, 500);
+  el.value = v; dLabel(k, v); setDelay(k, v); haptic(8);
+}
+function nudgeVol(k,delta){
+  var el = document.getElementById(k+"_v");
+  var v = clamp(parseFloat(el.value || 0) + delta, 0, 100);
+  el.value = v; vLabel(k, v); setVol(k, v); haptic(8);
+}
+function toggleMute(k){
+  var mb=document.getElementById(k+"_m"); var on=!mb.classList.contains("on");
+  mb.className = "muteb" + (on ? " on" : ""); mb.innerHTML = on ? ICON.mute : ICON.spk;  // optimistic
+  haptic();
+  cmd({action:"set_muted", name:cardData[k], muted:on});
+}
+function toggleDev(k){
+  var sw=document.getElementById(k+"_sw"); var on=!sw.classList.contains("on");
+  sw.className = "sw" + (on ? " on" : "");  // optimistic
+  haptic();
+  cmd({action:"toggle_device", name:cardData[k], enabled:on});
+}
+
+// Prefer Server-Sent Events (instant push); fall back to polling if the browser
+// lacks EventSource or the stream can't be established.
+var usingSSE = false;
+function connect() {
+  if (window.EventSource) {
+    try {
+      var es = new EventSource("/api/events?token=" + encodeURIComponent(token));
+      es.addEventListener("state", function(ev){
+        usingSSE = true; setOnline();
+        try { render(JSON.parse(ev.data)); } catch(e){}
+      });
+      es.onopen = function(){ setOnline(); };
+      es.onerror = function(){
+        setOffline();
+        // EventSource retries on its own; if it never connected, fall back to polling.
+        if (!usingSSE) { try { es.close(); } catch(e){} poll(); }
+      };
+      return;
+    } catch(e){}
+  }
+  poll();
+}
 
 function poll() {
   api("/api/state").then(function(r){
     if (r.status === 401) { localStorage.removeItem("sm_token"); location.reload(); return; }
+    setOnline();
     return r.json();
-  }).then(function(st){ if (st) render(st); }).catch(function(){})
-    .finally(function(){ setTimeout(poll, 1000); });
+  }).then(function(st){ if (st) render(st); })
+    .catch(function(){ setOffline(); })
+    .finally(function(){ if (!usingSSE) setTimeout(poll, 1000); });
 }
 
 // Auto-login when a QR link carries the token (?token=...): validate it, store

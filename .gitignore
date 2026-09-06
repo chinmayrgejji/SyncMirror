@@ -28,3 +28,6 @@ dist/
 .DS_Store
 Thumbs.db
 SyncMirror.zip
+
+# Local smoke-test output
+_smoke_err.txt

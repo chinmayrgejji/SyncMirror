@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [("SyncMirror.ico", ".")]
+datas = [("SyncMirror.ico", "."), ("assets/fonts", "assets/fonts")]
 binaries = []
 hiddenimports = [
     "winrt.windows.media.control",

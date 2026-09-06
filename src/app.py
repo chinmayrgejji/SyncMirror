@@ -62,6 +62,7 @@ BASE_SAFETY_MS = 150.0
 
 DELAY_MIN, DELAY_MAX = -500.0, 500.0
 BUFFER_METER_MAX_MS = 300.0  # meter is "full" at this many ms of headroom
+BUFFER_TARGET_MS = 90.0      # start of the "healthy" (green) zone; drives the tick
 
 # Default to the OS theme; the user can override it from the header switcher.
 ctk.set_appearance_mode("System")
@@ -135,6 +136,43 @@ def resource_path(relative):
 
 
 ICON_PATH = resource_path("SyncMirror.ico")
+
+
+def _register_bundled_fonts():
+    """Register any TTF/OTF fonts under assets/fonts for this process (private,
+    so nothing is installed system-wide) and return the preferred UI family.
+
+    Tk renders bundled fonts far more crisply at small sizes than the default;
+    if no Inter files are present we fall back to Segoe UI on Windows."""
+    family = "Segoe UI"
+    fonts_dir = resource_path(os.path.join("assets", "fonts"))
+    if not os.path.isdir(fonts_dir):
+        return family
+    try:
+        gdi32 = ctypes.windll.gdi32
+    except Exception:
+        return family
+    FR_PRIVATE = 0x10
+    registered_inter = False
+    for fname in os.listdir(fonts_dir):
+        if not fname.lower().endswith((".ttf", ".otf")):
+            continue
+        path = os.path.join(fonts_dir, fname)
+        try:
+            if gdi32.AddFontResourceExW(ctypes.c_wchar_p(path), FR_PRIVATE, 0):
+                if "inter" in fname.lower():
+                    registered_inter = True
+        except Exception:
+            pass
+    return "Inter" if registered_inter else family
+
+
+UI_FONT_FAMILY = _register_bundled_fonts()
+try:
+    # Applies to every CTkFont() that doesn't pass an explicit family.
+    ctk.ThemeManager.theme["CTkFont"]["family"] = UI_FONT_FAMILY
+except Exception:
+    pass
 
 
 def settings_path():
@@ -294,6 +332,11 @@ class DeviceCard(ctk.CTkFrame):
         self.volume_var = tk.DoubleVar(value=100.0)
         self.muted_var = tk.BooleanVar(value=False)
 
+        # Stutter history: remember when the count last climbed so we can show
+        # "2m ago" instead of a bare counter with no time context.
+        self._last_stutter_mono = None
+        self._prev_stutter_count = 0
+
         self.grid_columnconfigure(0, weight=1)
 
         # -- top row: name + enable switch --
@@ -383,6 +426,16 @@ class DeviceCard(ctk.CTkFrame):
             sticky="ew",
         )
 
+        # Floating value bubble while dragging either slider.
+        self.delay_slider.bind(
+            "<B1-Motion>",
+            lambda _e: self._show_slider_tip(f"{int(self.delay_var.get())} ms"))
+        self.delay_slider.bind("<ButtonRelease-1>", self._hide_slider_tip)
+        self.volume_slider.bind(
+            "<B1-Motion>",
+            lambda _e: self._show_slider_tip(f"{int(self.volume_var.get())}%"))
+        self.volume_slider.bind("<ButtonRelease-1>", self._hide_slider_tip)
+
         self.volume_label = ctk.CTkLabel(
             vol_row,
             text="100%",
@@ -433,26 +486,50 @@ class DeviceCard(ctk.CTkFrame):
         self.buffer_bar.set(0)
         self.buffer_bar.grid(row=0, column=1, sticky="ew", padx=PAD_S)
 
+        # A faint tick where the "healthy" (green) zone begins, so users learn what
+        # a good buffer looks like at a glance instead of decoding colours.
+        self.buffer_tick = ctk.CTkFrame(self.buffer_bar, width=2, height=10,
+                                        corner_radius=1, fg_color=TEXT_FAINT)
+        self.buffer_tick.place(relx=BUFFER_TARGET_MS / BUFFER_METER_MAX_MS,
+                               rely=0.5, anchor="center")
+
         self.buffer_label = ctk.CTkLabel(meter_row, text="--", width=52, anchor="e",
                                          text_color=TEXT_DIM,
                                          font=ctk.CTkFont(size=FS_LABEL))
         self.buffer_label.grid(row=0, column=2, sticky="e")
 
-        self.stutter_label = ctk.CTkLabel(meter_row, text="", width=64, anchor="e",
+        self.stutter_label = ctk.CTkLabel(meter_row, text="", width=96, anchor="e",
                                           text_color=TEXT_FAINT,
                                           font=ctk.CTkFont(size=FS_LABEL))
         self.stutter_label.grid(row=0, column=3, sticky="e", padx=(PAD_S, 0))
+        self._refresh_enabled_style()
+
+    def _refresh_enabled_style(self):
+        """Make inactive device controls read as inactive without hiding settings."""
+        active = self.enabled_var.get()
+        control_text = TEXT if active else TEXT_FAINT
+        slider_color = ACCENT if active else CARD_HI
+        self.delay_slider.configure(progress_color=slider_color, button_color=slider_color)
+        self.volume_slider.configure(progress_color=slider_color, button_color=slider_color)
+        self.delay_label.configure(text_color=control_text)
+        self.volume_label.configure(text_color=control_text)
+        self.buffer_label.configure(text_color=control_text)
+        self.stutter_label.configure(text_color=TEXT_DIM if active else TEXT_FAINT)
 
     def _nudge_btn(self, master, label, delta):
-        return ctk.CTkButton(
+        button = ctk.CTkButton(
             master, text=label, width=24, height=24, corner_radius=12,
             fg_color="transparent", hover_color=CARD_HI, border_width=1,
             border_color=BORDER, text_color=TEXT_DIM,
             font=ctk.CTkFont(size=FS_BODY, weight="bold"),
             command=lambda d=delta: self._nudge(d),
         )
+        # Right-click provides a finer one-millisecond adjustment.
+        button.bind("<Button-3>", lambda _event, d=delta: self._nudge(1 if d > 0 else -1))
+        return button
 
     def _toggled(self):
+        self._refresh_enabled_style()
         self.on_toggle(self.info["name"], self.enabled_var.get())
 
     def _delay_changed(self, value):
@@ -495,6 +572,28 @@ class DeviceCard(ctk.CTkFrame):
         else:
             self.mute_btn.configure(text="\U0001F50A", text_color=TEXT_DIM)
 
+    def _show_slider_tip(self, text):
+        """Show a small value bubble that follows the pointer while dragging."""
+        tip = getattr(self, "_slider_tip", None)
+        if tip is None or not tip.winfo_exists():
+            tip = tk.Toplevel(self)
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            self._slider_tip_lbl = tk.Label(
+                tip, bd=0, padx=8, pady=3, fg="#06121f",
+                font=("Segoe UI", 9, "bold"))
+            self._slider_tip_lbl.pack()
+            self._slider_tip = tip
+        self._slider_tip_lbl.config(text=text, bg=_c(ACCENT))
+        x, y = self.winfo_pointerxy()
+        self._slider_tip.geometry(f"+{x - 18}+{y - 40}")
+        self._slider_tip.deiconify()
+
+    def _hide_slider_tip(self, _event=None):
+        tip = getattr(self, "_slider_tip", None)
+        if tip is not None and tip.winfo_exists():
+            tip.withdraw()
+
     def apply_saved(self, delay=None, volume=None, muted=None, enabled=None):
         """Restore persisted settings onto the widgets WITHOUT firing the change
         callbacks (setting a var directly doesn't trigger a slider/switch command),
@@ -510,6 +609,7 @@ class DeviceCard(ctk.CTkFrame):
             self._refresh_mute_button()
         if enabled is not None:
             self.enabled_var.set(bool(enabled))
+        self._refresh_enabled_style()
 
     def update_live_stats(self, buffer_ms, stutter_count, active: bool):
         if not active:
@@ -517,6 +617,7 @@ class DeviceCard(ctk.CTkFrame):
             self.buffer_bar.configure(progress_color=CARD_HI)
             self.buffer_label.configure(text="--")
             self.stutter_label.configure(text="")
+            self._prev_stutter_count = 0
             return
 
         frac = max(0.0, min(1.0, buffer_ms / BUFFER_METER_MAX_MS))
@@ -530,10 +631,30 @@ class DeviceCard(ctk.CTkFrame):
         self.buffer_bar.configure(progress_color=color)
         self.buffer_label.configure(text=f"{int(buffer_ms)} ms")
 
+        if stutter_count > self._prev_stutter_count:
+            self._last_stutter_mono = time.monotonic()
+        elif stutter_count < self._prev_stutter_count:
+            self._last_stutter_mono = None  # counter reset (device restarted)
+        self._prev_stutter_count = stutter_count
+
         if stutter_count > 0:
-            self.stutter_label.configure(text=f"⚠ {stutter_count}", text_color=WARN)
+            self.stutter_label.configure(
+                text=f"⚠ {stutter_count} · {self._format_ago(self._last_stutter_mono)}",
+                text_color=WARN)
         else:
             self.stutter_label.configure(text="✓ clean", text_color=GOOD)
+
+    @staticmethod
+    def _format_ago(mono):
+        """Compact 'time since' label for the last stutter."""
+        if mono is None:
+            return "now"
+        delta = time.monotonic() - mono
+        if delta < 60:
+            return f"{int(delta)}s ago"
+        if delta < 3600:
+            return f"{int(delta // 60)}m ago"
+        return f"{int(delta // 3600)}h ago"
 
 
 class AudioEndpointWatcher:
@@ -670,6 +791,8 @@ class App:
         self._settings_save_handle = None
         self.web_remote = None
         self.web_command_queue = queue.Queue()
+        self._web_dialog = None          # persistent panel; kept open while server runs
+        self._web_enabled_var = None
 
         self._build_ui()
         self._populate_devices()
@@ -885,12 +1008,36 @@ class App:
         # -- scrollable device list --
         self.devices_frame = ctk.CTkScrollableFrame(devices_pane, fg_color="transparent")
         self.devices_frame.pack(fill="both", expand=True)
+        self.empty_devices_label = ctk.CTkLabel(
+            self.devices_frame,
+            text="No output devices detected\nConnect a speaker or headset, then refresh.",
+            text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_BODY),
+            justify="center",
+        )
+        self.empty_devices_label.pack(fill="x", pady=PAD_L)
 
         ctk.CTkLabel(
             devices_pane,
             text="Tip: start sync, play audio, then nudge each device's delay until they line up.",
             text_color=TEXT_FAINT, font=ctk.CTkFont(size=FS_LABEL), justify="left",
         ).pack(anchor="w", padx=PAD_XS, pady=(PAD_S, 0))
+
+        self.root.bind("<space>", self._keyboard_play_pause)
+        self.root.bind("<Control-m>", self._keyboard_mute)
+
+    def _keyboard_play_pause(self, _event=None):
+        self._media_play_pause()
+        return "break"
+
+    def _keyboard_mute(self, _event=None):
+        widget = self.root.focus_get()
+        while widget is not None:
+            if isinstance(widget, DeviceCard):
+                widget._toggle_mute()
+                return "break"
+            widget = getattr(widget, "master", None)
+        return "break"
 
     def _ghost_button(self, master, text, command, width=90, height=34, small=False):
         """Secondary action: outlined, transparent, never competing with Start."""
@@ -993,6 +1140,11 @@ class App:
                     out.stop()
                 self.cards[name].destroy()
                 del self.cards[name]
+
+        if current_names:
+            self.empty_devices_label.pack_forget()
+        elif not self.empty_devices_label.winfo_ismapped():
+            self.empty_devices_label.pack(fill="x", pady=PAD_L)
 
         if self.running:
             self.status_label.configure(
@@ -1799,13 +1951,20 @@ class App:
     # --------------------------------------------------------- web remote --
 
     def _toggle_web_remote(self):
+        # The header button just opens the panel now; the panel's own switch is
+        # what actually turns the server on and off.
         if WebRemote is None:
             return
-        if self.web_remote is not None:
-            self.web_remote.stop()
-            self.web_remote = None
-            self.web_btn.configure(text="Web Remote")
+        if self.web_remote is None and not self._start_web_remote():
             return
+        self._show_web_dialog()
+
+    def _start_web_remote(self):
+        """Start a fresh server (new PIN/QR each time). Returns True on success."""
+        if WebRemote is None:
+            return False
+        if self.web_remote is not None:
+            return True
         try:
             self.web_remote = WebRemote(self.web_command_queue)
             self.web_remote.start()
@@ -1813,406 +1972,227 @@ class App:
         except Exception as exc:
             self.web_remote = None
             messagebox.showerror("Web remote", f"Could not start server:\n{exc}")
-            return
-        self.web_btn.configure(text="Web Remote: ON")
-        url = f"http://{self.web_remote.local_ip()}:{self.web_remote.port}"
-        self._show_web_dialog(url, self.web_remote.token)
+            return False
+        self._update_web_btn()
+        return True
 
-    def _show_web_dialog(self, url, pin):
+    def _stop_web_remote(self):
+        if self.web_remote is not None:
+            self.web_remote.stop()
+            self.web_remote = None
+        self._update_web_btn()
+
+    def _update_web_btn(self):
+        self.web_btn.configure(
+            text="Web Remote: ON" if self.web_remote is not None else "Web Remote")
+
+    def _show_web_dialog(self):
+        # Reuse the panel if it's already open instead of spawning another.
+        if self._web_dialog is not None and self._web_dialog.winfo_exists():
+            self._refresh_web_dialog()
+            self._web_dialog.deiconify()
+            self._web_dialog.lift()
+            self._web_dialog.focus_force()
+            return
+
         dlg = ctk.CTkToplevel(self.root)
+        self._web_dialog = dlg
         dlg.title("Web Remote")
         dlg.configure(fg_color=BG)
         dlg.resizable(False, False)
         dlg.transient(self.root)
+        # Closing the panel leaves the server running; only the switch stops it.
+        dlg.protocol("WM_DELETE_WINDOW", self._close_web_dialog)
 
         # CustomTkinter needs the icon set after the window is realised.
         dlg.after(220, lambda: self._safe_iconbitmap(dlg))
 
-        # QR contains the token, so scanning it connects automatically.
-        login_url = f"{url}/?token={pin}"
-
-        # ------------------------------------------------------------------
-        # Main card
-        # ------------------------------------------------------------------
         card = ctk.CTkFrame(
-            dlg,
-            fg_color=CARD_BG,
-            corner_radius=16,
-            border_width=1,
-            border_color=BORDER,
+            dlg, fg_color=CARD_BG, corner_radius=16,
+            border_width=1, border_color=BORDER,
         )
-        card.pack(
-            padx=PAD_M,
-            pady=PAD_M,
-            fill="both",
-            expand=True,
-        )
+        card.pack(padx=PAD_M, pady=PAD_M, fill="both", expand=True)
 
-        # ------------------------------------------------------------------
-        # Header
-        # ------------------------------------------------------------------
-        header = ctk.CTkFrame(
-            card,
-            fg_color="transparent",
-        )
-        header.pack(
-            fill="x",
-            padx=PAD_L,
-            pady=(PAD_L, PAD_S),
-        )
+        # ---- Header: status dot + title + on/off switch ----
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=PAD_L, pady=(PAD_L, PAD_S))
 
-        # Status dot
-        ctk.CTkLabel(
-            header,
-            text="●",
-            text_color=GOOD,
-            font=ctk.CTkFont(size=16),
-            width=18,
-        ).pack(
-            side="left",
-            padx=(0, PAD_XS),
-        )
+        self._web_status_dot = ctk.CTkLabel(
+            header, text="●", text_color=GOOD,
+            font=ctk.CTkFont(size=16), width=18)
+        self._web_status_dot.pack(side="left", padx=(0, PAD_XS))
 
-        header_text = ctk.CTkFrame(
-            header,
-            fg_color="transparent",
-        )
-        header_text.pack(
-            side="left",
-            fill="x",
-            expand=True,
-        )
+        header_text = ctk.CTkFrame(header, fg_color="transparent")
+        header_text.pack(side="left", fill="x", expand=True)
 
         ctk.CTkLabel(
-            header_text,
-            text="Web Remote",
-            text_color=TEXT,
-            anchor="w",
-            font=ctk.CTkFont(
-                size=FS_TITLE,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-        )
+            header_text, text="Web Remote", text_color=TEXT, anchor="w",
+            font=ctk.CTkFont(size=FS_TITLE, weight="bold"),
+        ).pack(anchor="w")
 
         ctk.CTkLabel(
-            header_text,
-            text="Control SyncMirror from your phone",
-            text_color=TEXT_DIM,
-            anchor="w",
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-            ),
-        ).pack(
-            anchor="w",
-            pady=(1, 0),
-        )
+            header_text, text="Control SyncMirror from your phone",
+            text_color=TEXT_DIM, anchor="w",
+            font=ctk.CTkFont(size=FS_LABEL),
+        ).pack(anchor="w", pady=(1, 0))
 
-        # ------------------------------------------------------------------
-        # Main content
-        # ------------------------------------------------------------------
-        content = ctk.CTkFrame(
-            card,
-            fg_color="transparent",
-        )
-        content.pack(
-            fill="both",
-            expand=True,
-            padx=PAD_L,
-            pady=PAD_S,
-        )
+        self._web_enabled_var = tk.BooleanVar(value=self.web_remote is not None)
+        self._web_toggle_switch = ctk.CTkSwitch(
+            header, text="", variable=self._web_enabled_var,
+            command=self._on_web_toggle, progress_color=ACCENT, width=44)
+        self._web_toggle_switch.pack(side="right", padx=(PAD_S, 0))
 
+        # ---- Content: QR (left) + details (right) ----
+        content = ctk.CTkFrame(card, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=PAD_L, pady=PAD_S)
         content.grid_columnconfigure(0, weight=0)
         content.grid_columnconfigure(1, weight=1)
         content.grid_rowconfigure(0, weight=1)
 
-        # ------------------------------------------------------------------
-        # QR section
-        # ------------------------------------------------------------------
         qr_section = ctk.CTkFrame(
-            content,
-            fg_color=CARD_HI,
-            corner_radius=12,
-            border_width=1,
-            border_color=BORDER,
-        )
-        qr_section.grid(
-            row=0,
-            column=0,
-            sticky="nsew",
-            padx=(0, PAD_M),
-        )
+            content, fg_color=CARD_HI, corner_radius=12,
+            border_width=1, border_color=BORDER)
+        qr_section.grid(row=0, column=0, sticky="nsew", padx=(0, PAD_M))
 
         ctk.CTkLabel(
-            qr_section,
-            text="SCAN TO CONNECT",
-            text_color=TEXT_FAINT,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-                weight="bold",
-            ),
-        ).pack(
-            pady=(PAD_M, PAD_S),
-        )
+            qr_section, text="SCAN TO CONNECT", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).pack(pady=(PAD_M, PAD_S))
 
-        qr_image = self._make_qr_image(
-            login_url,
-            size=190,
-        )
+        qr_panel = ctk.CTkFrame(qr_section, fg_color="#ffffff", corner_radius=10)
+        qr_panel.pack(padx=PAD_M, pady=(0, PAD_S))
+        self._web_qr_label = ctk.CTkLabel(qr_panel, text="", width=190, height=190)
+        self._web_qr_label.pack(padx=8, pady=8)
 
-        if qr_image is not None:
-            qr_panel = ctk.CTkFrame(
-                qr_section,
-                fg_color="#ffffff",
-                corner_radius=10,
-            )
-            qr_panel.pack(
-                padx=PAD_M,
-                pady=(0, PAD_S),
-            )
+        self._web_qr_hint = ctk.CTkLabel(
+            qr_section, text="Scan with your phone camera",
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=FS_LABEL))
+        self._web_qr_hint.pack(pady=(0, PAD_M))
 
-            ctk.CTkLabel(
-                qr_panel,
-                text="",
-                image=qr_image,
-            ).pack(
-                padx=8,
-                pady=8,
-            )
+        details = ctk.CTkFrame(content, fg_color="transparent")
+        details.grid(row=0, column=1, sticky="nsew")
 
-            self._web_qr_image = qr_image
-
-            ctk.CTkLabel(
-                qr_section,
-                text="Scan with your phone camera",
-                text_color=TEXT_DIM,
-                font=ctk.CTkFont(
-                    size=FS_LABEL,
-                ),
-            ).pack(
-                pady=(0, PAD_M),
-            )
-        else:
-            ctk.CTkLabel(
-                qr_section,
-                text="QR code unavailable",
-                text_color=TEXT_DIM,
-                font=ctk.CTkFont(size=FS_BODY),
-            ).pack(
-                padx=PAD_L,
-                pady=PAD_L,
-            )
-
-        # ------------------------------------------------------------------
-        # Connection details section
-        # ------------------------------------------------------------------
-        details = ctk.CTkFrame(
-            content,
-            fg_color="transparent",
-        )
-        details.grid(
-            row=0,
-            column=1,
-            sticky="nsew",
-        )
-
-        # -- Connection status --
-        status_card = ctk.CTkFrame(
-            details,
-            fg_color=CARD_HI,
-            corner_radius=10,
-        )
-        status_card.pack(
-            fill="x",
-            pady=(0, PAD_S),
-        )
-
+        # -- Status --
+        status_card = ctk.CTkFrame(details, fg_color=CARD_HI, corner_radius=10)
+        status_card.pack(fill="x", pady=(0, PAD_S))
         ctk.CTkLabel(
-            status_card,
-            text="STATUS",
-            text_color=TEXT_FAINT,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-            padx=PAD_M,
-            pady=(PAD_M, 2),
-        )
-
-        ctk.CTkLabel(
-            status_card,
-            text="●  Remote server active",
-            text_color=GOOD,
-            anchor="w",
-            font=ctk.CTkFont(
-                size=FS_BODY,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-            padx=PAD_M,
-            pady=(0, PAD_M),
-        )
+            status_card, text="STATUS", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).pack(anchor="w", padx=PAD_M, pady=(PAD_M, 2))
+        self._web_status_label = ctk.CTkLabel(
+            status_card, text="●  Remote server active", text_color=GOOD,
+            anchor="w", font=ctk.CTkFont(size=FS_BODY, weight="bold"))
+        self._web_status_label.pack(anchor="w", padx=PAD_M, pady=(0, PAD_M))
 
         # -- Address --
-        address_card = ctk.CTkFrame(
-            details,
-            fg_color=CARD_HI,
-            corner_radius=10,
-        )
-        address_card.pack(
-            fill="x",
-            pady=(0, PAD_S),
-        )
-
+        address_card = ctk.CTkFrame(details, fg_color=CARD_HI, corner_radius=10)
+        address_card.pack(fill="x", pady=(0, PAD_S))
         ctk.CTkLabel(
-            address_card,
-            text="ADDRESS",
-            text_color=TEXT_FAINT,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-            padx=PAD_M,
-            pady=(PAD_M, 2),
-        )
-
-        address_row = ctk.CTkFrame(
-            address_card,
-            fg_color="transparent",
-        )
-        address_row.pack(
-            fill="x",
-            padx=PAD_M,
-            pady=(0, PAD_M),
-        )
-
-        ctk.CTkLabel(
-            address_row,
-            text=url,
-            text_color=ACCENT,
-            anchor="w",
-            font=ctk.CTkFont(
-                size=FS_BODY,
-                weight="bold",
-            ),
-        ).pack(
-            side="left",
-            fill="x",
-            expand=True,
-        )
-
-        ctk.CTkButton(
-            address_row,
-            text="Copy",
-            width=58,
-            height=28,
-            corner_radius=6,
-            fg_color="transparent",
-            hover_color=CARD_BG,
-            border_width=1,
-            border_color=BORDER,
-            text_color=TEXT_DIM,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-                weight="bold",
-            ),
-            command=lambda: self._copy_to_clipboard(url),
-        ).pack(
-            side="right",
-            padx=(PAD_S, 0),
-        )
+            address_card, text="ADDRESS", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).pack(anchor="w", padx=PAD_M, pady=(PAD_M, 2))
+        address_row = ctk.CTkFrame(address_card, fg_color="transparent")
+        address_row.pack(fill="x", padx=PAD_M, pady=(0, PAD_M))
+        self._web_address_label = ctk.CTkLabel(
+            address_row, text="", text_color=ACCENT, anchor="w",
+            font=ctk.CTkFont(size=FS_BODY, weight="bold"))
+        self._web_address_label.pack(side="left", fill="x", expand=True)
+        self._web_copy_btn = ctk.CTkButton(
+            address_row, text="Copy", width=58, height=28, corner_radius=6,
+            fg_color="transparent", hover_color=CARD_BG, border_width=1,
+            border_color=BORDER, text_color=TEXT_DIM,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+            command=lambda: self._copy_to_clipboard(self._web_url))
+        self._web_copy_btn.pack(side="right", padx=(PAD_S, 0))
 
         # -- PIN --
-        pin_card = ctk.CTkFrame(
-            details,
-            fg_color=CARD_HI,
-            corner_radius=10,
-        )
-        pin_card.pack(
-            fill="x",
-        )
-
+        pin_card = ctk.CTkFrame(details, fg_color=CARD_HI, corner_radius=10)
+        pin_card.pack(fill="x")
         ctk.CTkLabel(
-            pin_card,
-            text="ACCESS PIN",
-            text_color=TEXT_FAINT,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-            padx=PAD_M,
-            pady=(PAD_M, 0),
-        )
+            pin_card, text="ACCESS PIN", text_color=TEXT_FAINT,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).pack(anchor="w", padx=PAD_M, pady=(PAD_M, 0))
+        self._web_pin_label = ctk.CTkLabel(
+            pin_card, text="", text_color=TEXT,
+            font=ctk.CTkFont(size=FS_DISPLAY, weight="bold"))
+        self._web_pin_label.pack(anchor="w", padx=PAD_M, pady=(0, PAD_M))
 
+        # ---- Footer ----
+        footer = ctk.CTkFrame(card, fg_color="transparent")
+        footer.pack(fill="x", padx=PAD_L, pady=(PAD_S, PAD_L))
         ctk.CTkLabel(
-            pin_card,
-            text=str(pin),
-            text_color=TEXT,
-            font=ctk.CTkFont(
-                size=FS_DISPLAY,
-                weight="bold",
-            ),
-        ).pack(
-            anchor="w",
-            padx=PAD_M,
-            pady=(0, PAD_M),
-        )
-
-        # ------------------------------------------------------------------
-        # Footer
-        # ------------------------------------------------------------------
-        footer = ctk.CTkFrame(
-            card,
-            fg_color="transparent",
-        )
-        footer.pack(
-            fill="x",
-            padx=PAD_L,
-            pady=(PAD_S, PAD_L),
-        )
-
-        ctk.CTkLabel(
-            footer,
-            text="Phone and computer must be on the same Wi-Fi network.",
-            text_color=TEXT_DIM,
-            font=ctk.CTkFont(
-                size=FS_LABEL,
-            ),
-        ).pack(
-            side="left",
-        )
-
+            footer, text="Phone and computer must be on the same Wi-Fi network.",
+            text_color=TEXT_DIM, font=ctk.CTkFont(size=FS_LABEL),
+        ).pack(side="left")
         ctk.CTkButton(
-            footer,
-            text="Done",
-            width=90,
-            height=34,
-            corner_radius=8,
-            fg_color=ACCENT,
-            hover_color=ACCENT_HOVER,
-            font=ctk.CTkFont(
-                size=FS_BODY,
-                weight="bold",
-            ),
-            command=dlg.destroy,
-        ).pack(
-            side="right",
-        )
+            footer, text="Done", width=90, height=34, corner_radius=8,
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            font=ctk.CTkFont(size=FS_BODY, weight="bold"),
+            command=self._close_web_dialog,
+        ).pack(side="right")
 
-        # ------------------------------------------------------------------
-        # Finalise / centre
-        # ------------------------------------------------------------------
+        self._web_url = ""
+        self._refresh_web_dialog()
         dlg.update_idletasks()
         self._center_over_root(dlg)
-        dlg.grab_set()
+
+    def _refresh_web_dialog(self):
+        """Repaint the panel's dynamic parts (QR, PIN, address, status) for the
+        current server state. Turning the switch off then on lands here with a
+        brand-new server, so the QR and PIN refresh automatically."""
+        dlg = self._web_dialog
+        if dlg is None or not dlg.winfo_exists():
+            return
+        running = self.web_remote is not None
+        if self._web_enabled_var is not None:
+            self._web_enabled_var.set(running)
+
+        if running:
+            url = f"http://{self.web_remote.local_ip()}:{self.web_remote.port}"
+            pin = self.web_remote.token
+            self._web_url = url
+            qr = self._make_qr_image(f"{url}/?token={pin}", size=190)
+            self._web_qr_image = qr
+            if qr is not None:
+                self._web_qr_label.configure(image=qr, text="")
+            else:
+                self._web_qr_label.configure(
+                    image=None, text="QR unavailable", text_color=TEXT_DIM,
+                    font=ctk.CTkFont(size=FS_BODY))
+            self._web_qr_hint.configure(text="Scan with your phone camera")
+            self._web_status_dot.configure(text_color=GOOD)
+            self._web_status_label.configure(
+                text="●  Remote server active", text_color=GOOD)
+            self._web_address_label.configure(text=url, text_color=ACCENT)
+            self._web_copy_btn.configure(state="normal")
+            self._web_pin_label.configure(text=str(pin), text_color=TEXT)
+        else:
+            self._web_url = ""
+            self._web_qr_image = None
+            self._web_qr_label.configure(
+                image=None, text="Server off", text_color=TEXT_DIM,
+                font=ctk.CTkFont(size=FS_BODY, weight="bold"))
+            self._web_qr_hint.configure(text="Turn the switch on to connect")
+            self._web_status_dot.configure(text_color=TEXT_FAINT)
+            self._web_status_label.configure(
+                text="○  Remote server stopped", text_color=TEXT_DIM)
+            self._web_address_label.configure(text="—", text_color=TEXT_DIM)
+            self._web_copy_btn.configure(state="disabled")
+            self._web_pin_label.configure(text="— — — — — —", text_color=TEXT_FAINT)
+
+    def _on_web_toggle(self):
+        if self._web_enabled_var.get():
+            if not self._start_web_remote():
+                self._web_enabled_var.set(False)
+                return
+        else:
+            self._stop_web_remote()
+        self._refresh_web_dialog()
+
+    def _close_web_dialog(self):
+        if self._web_dialog is not None and self._web_dialog.winfo_exists():
+            self._web_dialog.destroy()
+        self._web_dialog = None
 
     def _make_qr_image(self, data, size=190):
         try:

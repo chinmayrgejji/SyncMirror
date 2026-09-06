@@ -42,7 +42,11 @@ Windows.
 - **Phone/web remote** — an optional PIN-protected mobile web page (a tiny Flask
   server on your LAN) to control playback, sync, per-device delay/volume/mute,
   and see the now-playing track + album art from your phone. Scan the QR code in
-  the app to connect and log in instantly — no typing the PIN.
+  the app to connect and log in instantly — no typing the PIN. The remote is an
+  **installable PWA** with **real-time updates over Server-Sent Events**,
+  optimistic controls, a screen wake-lock, and auto-reconnect. In the desktop
+  app the remote lives in a persistent panel with an in-panel on/off switch that
+  refreshes the QR code and connection details when toggled.
 - **System tray** — minimize to the tray with a live status (running / device
   count) and quick Start/Stop/Reset/Show/Quit actions.
 - **Persisted per-device settings** — each device's delay, volume, mute, and
@@ -50,6 +54,9 @@ Windows.
   `%APPDATA%\SyncMirror\settings.json` and restored automatically, so you don't
   re-tune the sliders every launch.
 - **Consistent output quality** across all devices through WASAPI shared mode.
+- **Polished desktop UI** — bundled Inter typeface, a live per-device buffer
+  meter, an "N · Xm ago" stutter age indicator, and drag tooltips on the
+  delay/volume sliders.
 - Per-device stutter logging to `stutter_logs/` for diagnosing sync issues.
 
 ## Requirements
@@ -100,6 +107,9 @@ full build/packaging reference.
 
 ## What to build next
 
+- **Global equalizer**: a single EQ applied once at the capture stage (before
+  the shared ring buffer) so every mirrored device hears the same tuned output
+  at no per-device CPU cost. *(In progress.)*
 - **Auto-delay calibration**: play a short test click, record it back via a
   phone/mic, and auto-measure each device's actual latency instead of tuning
   the sliders by ear. Biggest quality-of-life upgrade left.
