@@ -54,6 +54,10 @@ Windows.
   `%APPDATA%\SyncMirror\settings.json` and restored automatically, so you don't
   re-tune the sliders every launch.
 - **Consistent output quality** across all devices through WASAPI shared mode.
+- **Global equalizer** — a 10-band graphic EQ (with presets) applied *once* at
+  the capture stage, before the shared ring buffer, so every mirrored device
+  hears the same tuned output at no per-device CPU cost. Adjustable from the
+  desktop app and the phone web remote.
 - **Polished desktop UI** — bundled Inter typeface, a live per-device buffer
   meter, an "N · Xm ago" stutter age indicator, and drag tooltips on the
   delay/volume sliders.
@@ -107,9 +111,6 @@ full build/packaging reference.
 
 ## What to build next
 
-- **Global equalizer**: a single EQ applied once at the capture stage (before
-  the shared ring buffer) so every mirrored device hears the same tuned output
-  at no per-device CPU cost. *(In progress.)*
 - **Auto-delay calibration**: play a short test click, record it back via a
   phone/mic, and auto-measure each device's actual latency instead of tuning
   the sliders by ear. Biggest quality-of-life upgrade left.
@@ -128,6 +129,7 @@ src/
   ring_buffer.py            # the core: shared, sample-indexed circular buffer + per-device delay/drift logic
   capture.py                # WASAPI loopback capture -> ring buffer; subprocess-based device enumeration
   output.py                 # per-device WASAPI shared-mode output <- ring buffer; disconnect self-detection
+  equalizer.py              # global 10-band graphic EQ (biquad cascade) applied once before the ring buffer
   app.py                    # customtkinter UI, live device list, now-playing panel, tray, persistence, disconnect watcher
   webremote.py              # optional PIN-protected Flask phone/web remote (state snapshot + command queue)
   check_media_metadata.py   # helper for inspecting GlobalSystemMediaTransportControls metadata

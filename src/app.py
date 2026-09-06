@@ -54,6 +54,9 @@ except ImportError:
 from ring_buffer import SyncRingBuffer
 from capture import LoopbackCapture
 from output import DeviceOutput
+from equalizer import (
+    GraphicEqualizer, EQ_BANDS, EQ_GAIN_MIN, EQ_GAIN_MAX, EQ_PRESETS, DEFAULT_PRESET,
+)
 
 SAMPLERATE = 48000  # fallback only; capture.prepare() detects the real one
 CHANNELS = 2
@@ -193,11 +196,14 @@ class SettingsStore:
     def __init__(self):
         self.path = settings_path()
         self.devices = {}
+        self.eq = {}
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("devices"), dict):
                 self.devices = data["devices"]
+            if isinstance(data, dict) and isinstance(data.get("eq"), dict):
+                self.eq = data["eq"]
         except (OSError, ValueError):
             self.devices = {}
 
@@ -208,12 +214,15 @@ class SettingsStore:
     def update(self, name, **fields):
         self.devices.setdefault(name, {}).update(fields)
 
+    def update_eq(self, **fields):
+        self.eq.update(fields)
+
     def save(self):
         # Atomic write so a crash mid-save can't corrupt the settings file.
         try:
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"devices": self.devices}, f, indent=2)
+                json.dump({"devices": self.devices, "eq": self.eq}, f, indent=2)
             os.replace(tmp, self.path)
         except OSError:
             pass
@@ -749,6 +758,8 @@ class App:
 
         self.ring_buffer = None
         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
+        self.equalizer = GraphicEqualizer(EQ_BANDS)
+        self.capture.equalizer = self.equalizer
         self.media = MediaController()
 
         self.endpoint_watcher = AudioEndpointWatcher()
@@ -793,8 +804,14 @@ class App:
         self.web_command_queue = queue.Queue()
         self._web_dialog = None          # persistent panel; kept open while server runs
         self._web_enabled_var = None
+        self._eq_dialog = None
+        self._eq_enabled_var = None
+        self._eq_band_vars = []
+        self._eq_band_labels = []
+        self._eq_preset_var = None
 
         self._build_ui()
+        self._load_eq_settings()
         self._populate_devices()
         self.root.after(500, self._poll_device_scan_results)
         self.root.after(1500, self._auto_rescan)
@@ -894,6 +911,10 @@ class App:
         if WebRemote is None:
             self.web_btn.configure(state="disabled")
         self.web_btn.pack(side="right")
+
+        self.eq_btn = self._ghost_button(btn_row, "Equalizer", self._toggle_equalizer,
+                                         width=96)
+        self.eq_btn.pack(side="right", padx=(0, PAD_S))
 
         src_row = ctk.CTkFrame(controls, fg_color=CARD_HI, corner_radius=8)
         src_row.pack(fill="x", padx=PAD_M, pady=(0, PAD_M))
@@ -1236,9 +1257,11 @@ class App:
         except Exception:
             pass
         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
+        self.capture.equalizer = self.equalizer
 
         try:
             samplerate = self.capture.prepare()
+            self.equalizer.configure(samplerate, CHANNELS)
             self.ring_buffer = SyncRingBuffer(RING_BUFFER_SECONDS, CHANNELS, samplerate)
             self.capture.start(self.ring_buffer)
         except Exception as e:
@@ -1348,8 +1371,10 @@ class App:
 
         # fresh instance -> next Pa_Initialize() is a genuine 0 -> 1 hardware scan
         self.capture = LoopbackCapture(samplerate=None, channels=CHANNELS)
+        self.capture.equalizer = self.equalizer
         try:
             samplerate = self.capture.prepare()
+            self.equalizer.configure(samplerate, CHANNELS)
             self.ring_buffer = SyncRingBuffer(RING_BUFFER_SECONDS, CHANNELS, samplerate)
             self.capture.start(self.ring_buffer)
         except Exception as e:
@@ -2194,6 +2219,194 @@ class App:
             self._web_dialog.destroy()
         self._web_dialog = None
 
+    # --------------------------------------------------------- equalizer --
+
+    @staticmethod
+    def _fmt_band(hz):
+        return f"{hz // 1000}k" if hz >= 1000 else str(hz)
+
+    @staticmethod
+    def _fmt_gain(db):
+        v = int(round(db))
+        return f"+{v}" if v > 0 else str(v)
+
+    def _load_eq_settings(self):
+        eq = self.settings.eq if isinstance(self.settings.eq, dict) else {}
+        gains = eq.get("gains")
+        if isinstance(gains, list) and gains:
+            self.equalizer.set_gains(gains)
+        self.equalizer.set_enabled(bool(eq.get("enabled", False)))
+        self._update_eq_btn()
+
+    def _update_eq_btn(self):
+        self.eq_btn.configure(
+            text="Equalizer: ON" if self.equalizer.is_enabled() else "Equalizer")
+
+    def _detect_preset(self, gains):
+        for name, preset in EQ_PRESETS.items():
+            if all(abs(a - b) < 0.5 for a, b in zip(gains, preset)):
+                return name
+        return "Custom"
+
+    def _toggle_equalizer(self):
+        self._show_eq_dialog()
+
+    def _record_eq_settings(self):
+        snap = self.equalizer.snapshot()
+        self.settings.update_eq(enabled=snap["enabled"], gains=snap["gains"])
+        self._schedule_settings_save()
+
+    def _show_eq_dialog(self):
+        if self._eq_dialog is not None and self._eq_dialog.winfo_exists():
+            self._refresh_eq_dialog()
+            self._eq_dialog.deiconify()
+            self._eq_dialog.lift()
+            self._eq_dialog.focus_force()
+            return
+
+        dlg = ctk.CTkToplevel(self.root)
+        self._eq_dialog = dlg
+        dlg.title("Equalizer")
+        dlg.configure(fg_color=BG)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.protocol("WM_DELETE_WINDOW", self._close_eq_dialog)
+        dlg.after(220, lambda: self._safe_iconbitmap(dlg))
+
+        card = ctk.CTkFrame(dlg, fg_color=CARD_BG, corner_radius=16,
+                            border_width=1, border_color=BORDER)
+        card.pack(padx=PAD_M, pady=PAD_M, fill="both", expand=True)
+
+        # ---- Header: title + enable switch ----
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=PAD_L, pady=(PAD_L, PAD_S))
+
+        header_text = ctk.CTkFrame(header, fg_color="transparent")
+        header_text.pack(side="left", fill="x", expand=True)
+        ctk.CTkLabel(header_text, text="Global Equalizer", text_color=TEXT, anchor="w",
+                     font=ctk.CTkFont(size=FS_TITLE, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(header_text, text="Applied once to every mirrored device",
+                     text_color=TEXT_DIM, anchor="w",
+                     font=ctk.CTkFont(size=FS_LABEL)).pack(anchor="w", pady=(1, 0))
+
+        self._eq_enabled_var = tk.BooleanVar(value=self.equalizer.is_enabled())
+        ctk.CTkSwitch(header, text="", variable=self._eq_enabled_var,
+                      command=self._on_eq_toggle, progress_color=ACCENT,
+                      width=44).pack(side="right", padx=(PAD_S, 0))
+
+        # ---- Preset row ----
+        preset_row = ctk.CTkFrame(card, fg_color=CARD_HI, corner_radius=10)
+        preset_row.pack(fill="x", padx=PAD_L, pady=(0, PAD_S))
+        ctk.CTkLabel(preset_row, text="PRESET", text_color=TEXT_FAINT,
+                     font=ctk.CTkFont(size=FS_LABEL, weight="bold")
+                     ).pack(side="left", padx=PAD_M, pady=PAD_S)
+        self._eq_preset_var = tk.StringVar(
+            value=self._detect_preset(self.equalizer.get_gains()))
+        ctk.CTkOptionMenu(
+            preset_row, variable=self._eq_preset_var,
+            values=list(EQ_PRESETS.keys()) + ["Custom"],
+            command=self._on_eq_preset_change, width=150,
+            fg_color=CARD_BG, button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+            font=ctk.CTkFont(size=FS_LABEL, weight="bold"),
+        ).pack(side="left", padx=(0, PAD_M), pady=PAD_S)
+        self._ghost_button(preset_row, "Reset", self._reset_eq, width=64,
+                           height=28, small=True).pack(side="right", padx=PAD_M)
+
+        # ---- Band sliders ----
+        bands_frame = ctk.CTkFrame(card, fg_color="transparent")
+        bands_frame.pack(fill="both", expand=True, padx=PAD_L, pady=(PAD_S, 0))
+
+        gains = self.equalizer.get_gains()
+        self._eq_band_vars = []
+        self._eq_band_labels = []
+        for i, hz in enumerate(EQ_BANDS):
+            col = ctk.CTkFrame(bands_frame, fg_color="transparent")
+            col.pack(side="left", expand=True, padx=PAD_XS)
+
+            value_label = ctk.CTkLabel(col, text=self._fmt_gain(gains[i]),
+                                       text_color=TEXT_DIM, width=34,
+                                       font=ctk.CTkFont(size=FS_LABEL, weight="bold"))
+            value_label.pack()
+            self._eq_band_labels.append(value_label)
+
+            var = tk.DoubleVar(value=gains[i])
+            self._eq_band_vars.append(var)
+            ctk.CTkSlider(
+                col, from_=EQ_GAIN_MIN, to=EQ_GAIN_MAX, variable=var,
+                orientation="vertical", height=170, width=16,
+                progress_color=ACCENT, button_color=ACCENT,
+                button_hover_color=ACCENT_HOVER,
+                command=lambda v, idx=i: self._on_eq_band_change(idx, v),
+            ).pack(pady=PAD_XS)
+
+            ctk.CTkLabel(col, text=self._fmt_band(hz), text_color=TEXT_FAINT,
+                         font=ctk.CTkFont(size=FS_LABEL)).pack()
+
+        # ---- Footer ----
+        footer = ctk.CTkFrame(card, fg_color="transparent")
+        footer.pack(fill="x", padx=PAD_L, pady=(PAD_M, PAD_L))
+        ctk.CTkLabel(footer, text="\u00b112 dB per band \u00b7 boost or cut each frequency.",
+                     text_color=TEXT_DIM, font=ctk.CTkFont(size=FS_LABEL)).pack(side="left")
+        ctk.CTkButton(footer, text="Done", width=90, height=34, corner_radius=8,
+                      fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      font=ctk.CTkFont(size=FS_BODY, weight="bold"),
+                      command=self._close_eq_dialog).pack(side="right")
+
+        dlg.update_idletasks()
+        self._center_over_root(dlg)
+
+    def _refresh_eq_dialog(self):
+        dlg = self._eq_dialog
+        if dlg is None or not dlg.winfo_exists():
+            return
+        gains = self.equalizer.get_gains()
+        for i, g in enumerate(gains):
+            if i < len(self._eq_band_vars):
+                self._eq_band_vars[i].set(g)
+                self._eq_band_labels[i].configure(text=self._fmt_gain(g))
+        if self._eq_enabled_var is not None:
+            self._eq_enabled_var.set(self.equalizer.is_enabled())
+        if self._eq_preset_var is not None:
+            self._eq_preset_var.set(self._detect_preset(gains))
+
+    def _on_eq_toggle(self):
+        self.equalizer.set_enabled(bool(self._eq_enabled_var.get()))
+        self._update_eq_btn()
+        self._record_eq_settings()
+        self._publish_web_state()
+
+    def _on_eq_band_change(self, index, value):
+        self.equalizer.set_band(index, float(value))
+        if index < len(self._eq_band_labels):
+            self._eq_band_labels[index].configure(text=self._fmt_gain(float(value)))
+        if self._eq_preset_var is not None:
+            self._eq_preset_var.set(self._detect_preset(self.equalizer.get_gains()))
+        self._record_eq_settings()
+
+    def _on_eq_preset_change(self, name):
+        if name == "Custom":
+            return
+        gains = self.equalizer.apply_preset(name)
+        if gains is None:
+            return
+        for i, g in enumerate(gains):
+            if i < len(self._eq_band_vars):
+                self._eq_band_vars[i].set(g)
+                self._eq_band_labels[i].configure(text=self._fmt_gain(g))
+        self._update_eq_btn()
+        self._record_eq_settings()
+        self._publish_web_state()
+
+    def _reset_eq(self):
+        if self._eq_preset_var is not None:
+            self._eq_preset_var.set("Flat")
+        self._on_eq_preset_change("Flat")
+
+    def _close_eq_dialog(self):
+        if self._eq_dialog is not None and self._eq_dialog.winfo_exists():
+            self._eq_dialog.destroy()
+        self._eq_dialog = None
+
     def _make_qr_image(self, data, size=190):
         try:
             import qrcode
@@ -2282,6 +2495,21 @@ class App:
                 if card:
                     card.enabled_var.set(bool(cmd.get("enabled")))
                     card._toggled()
+            elif action == "set_eq_enabled":
+                self.equalizer.set_enabled(bool(cmd.get("enabled")))
+                self._update_eq_btn()
+                self._refresh_eq_dialog()
+                self._record_eq_settings()
+            elif action == "set_eq_band":
+                self.equalizer.set_band(int(cmd.get("index", -1)),
+                                        float(cmd.get("gain", 0)))
+                self._refresh_eq_dialog()
+                self._record_eq_settings()
+            elif action == "set_eq_preset":
+                if self.equalizer.apply_preset(cmd.get("preset")) is not None:
+                    self._update_eq_btn()
+                    self._refresh_eq_dialog()
+                    self._record_eq_settings()
         except Exception as exc:
             print(f"[SyncMirror] web command error: {exc}", flush=True)
 
@@ -2314,6 +2542,7 @@ class App:
                 "source_delay": self.source_delay.get(),
                 "now_playing": now_playing,
                 "devices": devices,
+                "eq": self.equalizer.snapshot(),
             })
         self.root.after(700, self._publish_web_state)
 

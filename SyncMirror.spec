@@ -12,7 +12,7 @@ hiddenimports = [
     "webremote",
 ]
 
-for pkg in ("customtkinter", "pyaudiowpatch", "winrt", "pystray", "flask", "werkzeug", "jinja2", "qrcode"):
+for pkg in ("customtkinter", "pyaudiowpatch", "winrt", "pystray", "flask", "werkzeug", "jinja2", "qrcode", "scipy"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b

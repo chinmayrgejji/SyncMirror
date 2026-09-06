@@ -23,6 +23,7 @@ from flask import Flask, Response, jsonify, request
 KNOWN_ACTIONS = {
     "toggle_sync", "start", "stop", "set_source_delay", "media",
     "set_delay", "set_volume", "set_muted", "toggle_device",
+    "set_eq_enabled", "set_eq_band", "set_eq_preset",
 }
 
 
@@ -33,7 +34,8 @@ class WebRemote:
         # 6-digit PIN shown in the desktop app; required on every /api call.
         self.token = f"{secrets.randbelow(1000000):06d}"
         self._state = {"running": False, "source_delay": 0.0,
-                       "now_playing": None, "devices": []}
+                       "now_playing": None, "devices": [],
+                       "eq": {"enabled": False, "gains": [], "bands": []}}
         self._state_lock = threading.Lock()
         # A Condition over the same lock lets SSE clients block until the state
         # actually changes instead of polling on a timer.
@@ -333,6 +335,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
                  border-radius:10px; border:1px solid var(--border); background:var(--card); color:var(--text); }
   .muted-text { color:var(--dim); font-size:13px; }
   .empty { color:var(--faint); font-size:13px; text-align:center; padding:20px; }
+  .presets { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { padding:8px 12px; border-radius:20px; border:1px solid var(--border);
+          background:transparent; color:var(--dim); font-size:13px; font-weight:700; }
+  .chip.on { background:var(--accent); color:#06121f; border-color:var(--accent); }
+  .eqrow { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .eqrow .bl { width:40px; font-size:12px; color:var(--dim); font-weight:700; }
+  .eqrow .bv { width:40px; text-align:right; font-size:12px; color:var(--text); font-weight:700; }
 </style>
 </head>
 <body>
@@ -355,6 +364,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="tabs">
     <div class="tab active" data-tab="playback" onclick="showTab('playback')">Playback</div>
     <div class="tab" data-tab="devices" onclick="showTab('devices')">Devices</div>
+    <div class="tab" data-tab="eq" onclick="showTab('eq')">EQ</div>
   </div>
 
   <div class="page active" id="page-playback">
@@ -395,6 +405,21 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <div class="page" id="page-devices">
     <div id="devlist"></div>
     <div class="empty" id="dev-empty" style="display:none;">No output devices detected.</div>
+  </div>
+
+  <div class="page" id="page-eq">
+    <div class="card">
+      <div class="row">
+        <span class="label">EQUALIZER</span>
+        <div class="sw" id="eq_sw" onclick="toggleEq()"></div>
+      </div>
+      <div class="muted-text" style="margin-top:6px;">One global EQ, applied to every device at once.</div>
+    </div>
+    <div class="card">
+      <div class="label" style="margin-bottom:10px;">PRESETS</div>
+      <div id="eq-presets" class="presets"></div>
+    </div>
+    <div class="card" id="eq-bands"></div>
   </div>
 </div>
 
@@ -561,6 +586,7 @@ function render(st) {
     list.innerHTML = st.devices.map(deviceCard).join("");
   }
   st.devices.forEach(updateDeviceCard);
+  renderEq(st.eq);
 }
 
 // Advance the progress bar locally between server events so it never stutters.
@@ -643,6 +669,68 @@ function toggleDev(k){
   haptic();
   cmd({action:"toggle_device", name:cardData[k], enabled:on});
 }
+
+// ---- Equalizer (global; one curve shared by every device) ----
+var EQ_PRESETS = {
+  "Flat":[0,0,0,0,0,0,0,0,0,0],
+  "Bass Boost":[7,6,5,3,1,0,0,0,0,0],
+  "Treble Boost":[0,0,0,0,0,1,3,5,6,7],
+  "Vocal":[-3,-2,-1,2,4,4,3,1,0,-1],
+  "Rock":[5,4,2,-1,-1,0,2,4,5,5],
+  "Loudness":[6,5,3,0,-1,-1,1,3,5,6]
+};
+var EQ_ORDER = ["Flat","Bass Boost","Treble Boost","Vocal","Rock","Loudness"];
+function fmtHz(h){ return h>=1000 ? (h/1000)+"k" : (""+h); }
+function fmtGain(v){ v=Math.round(v); return (v>0?"+":"")+v; }
+function detectPreset(g){
+  for (var i=0;i<EQ_ORDER.length;i++){ var n=EQ_ORDER[i], p=EQ_PRESETS[n], ok=true;
+    for (var j=0;j<p.length;j++){ if (Math.abs((g[j]||0)-p[j])>=0.5){ ok=false; break; } }
+    if (ok) return n; }
+  return "Custom";
+}
+function renderEq(eq){
+  if (!eq) return;
+  var sw=document.getElementById("eq_sw"); if (sw) sw.className="sw"+(eq.enabled?" on":"");
+  var bands=eq.bands||[], gains=eq.gains||[];
+  var presWrap=document.getElementById("eq-presets");
+  if (presWrap && !presWrap.dataset.built){ presWrap.dataset.built="1";
+    presWrap.innerHTML = EQ_ORDER.map(function(n){
+      return '<button class="chip" data-p="'+esc(n)+'" onclick="setEqPreset(\''+esc(n)+'\')">'+esc(n)+'</button>';
+    }).join("");
+  }
+  var wrap=document.getElementById("eq-bands");
+  if (wrap && wrap.dataset.bands !== bands.join(",")){
+    wrap.dataset.bands = bands.join(",");
+    wrap.innerHTML = bands.map(function(h,i){
+      return '<div class="eqrow">'+
+        '<span class="bl">'+fmtHz(h)+'</span>'+
+        '<input type="range" min="-12" max="12" step="1" id="eqb_'+i+'" '+
+          'ontouchstart="dragOn(\'eq_'+i+'\')" onmousedown="dragOn(\'eq_'+i+'\')" '+
+          'oninput="eqLabel('+i+',this.value)" onchange="setEqBand('+i+',this.value)">'+
+        '<span class="bv" id="eqv_'+i+'">0</span>'+
+      '</div>';
+    }).join("");
+  }
+  gains.forEach(function(g,i){
+    if (dragging["eq_"+i]) return;
+    var el=document.getElementById("eqb_"+i);
+    if (el && document.activeElement!==el){ el.value=g;
+      document.getElementById("eqv_"+i).textContent=fmtGain(g); fillTrack(el); }
+  });
+  var active=detectPreset(gains);
+  if (presWrap){ presWrap.querySelectorAll(".chip").forEach(function(c){
+    c.classList.toggle("on", c.dataset.p===active); }); }
+}
+function toggleEq(){
+  var sw=document.getElementById("eq_sw"); var on=!sw.classList.contains("on");
+  sw.className="sw"+(on?" on":""); haptic();  // optimistic
+  cmd({action:"set_eq_enabled", enabled:on});
+}
+function eqLabel(i,v){ document.getElementById("eqv_"+i).textContent=fmtGain(v);
+  fillTrack(document.getElementById("eqb_"+i)); }
+function setEqBand(i,v){ dragging["eq_"+i]=false;
+  cmd({action:"set_eq_band", index:i, gain:parseFloat(v)}); }
+function setEqPreset(n){ haptic(); cmd({action:"set_eq_preset", preset:n}); }
 
 // Prefer Server-Sent Events (instant push); fall back to polling if the browser
 // lacks EventSource or the stream can't be established.

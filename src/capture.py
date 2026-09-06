@@ -121,6 +121,9 @@ class LoopbackCapture:
         self.samplerate = samplerate
         self.channels = channels
         self.frames_per_buffer = frames_per_buffer
+        # Optional global equalizer applied once here, before the ring buffer, so
+        # every downstream device shares one tuned stream at no per-device cost.
+        self.equalizer = None
         self._pa = pyaudio.PyAudio()
         self._stream = None
         self.device_info = None
@@ -163,6 +166,9 @@ class LoopbackCapture:
             # in_data is raw interleaved float32 PCM from WASAPI loopback
             samples = np.frombuffer(in_data, dtype=np.float32)
             frames = samples.reshape(-1, self.channels)
+            eq = self.equalizer
+            if eq is not None:
+                frames = eq.process(frames)
             ring_buffer.write(frames)
             return (None, pyaudio.paContinue)
 
