@@ -20,6 +20,7 @@ Design:
   jumping -- this avoids audible clicks.
 """
 
+import queue
 import threading
 import numpy as np
 import logging
@@ -90,6 +91,9 @@ class SyncRingBuffer:
         logs_root = os.path.join(os.path.dirname(__file__), '..', 'stutter_logs')
         os.makedirs(logs_root, exist_ok=True)
         self._stutter_logs_root = os.path.abspath(logs_root)
+        # Audio callbacks only enqueue; this thread does the logging and disk I/O.
+        self._log_queue: queue.SimpleQueue = queue.SimpleQueue()
+        threading.Thread(target=self._log_worker, daemon=True, name="stutter-log").start()
 
         # Drift-correction tuning
         self.max_drift_frames = int(0.020 * samplerate)   # allow +/-20ms before correcting
@@ -98,6 +102,30 @@ class SyncRingBuffer:
         self.min_adaptive_bump_frames = int(0.010 * samplerate)  # at least 10ms on underrun
         # If a reader experiences this many consecutive underruns, perform a fast resync
         self.underrun_resync_threshold = 3
+
+    def _log_worker(self):
+        while True:
+            name, cnt, n_frames, available, missing, write_pos, read_pos = self._log_queue.get()
+            logger.warning(
+                "STUTTER: reader=%s requested=%d available=%d missing=%d write_pos=%d read_pos=%s",
+                name, n_frames, available, missing, write_pos, str(read_pos),
+            )
+            safe_name = (
+                name.replace(' ', '_')
+                .replace('/', '_')
+                .replace('\\', '_')
+                .replace('(', '')
+                .replace(')', '')
+            )
+            log_path = os.path.join(self._stutter_logs_root, f"{safe_name}.log")
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{datetime.utcnow().isoformat()}Z stutter#{cnt} reader={name} requested={n_frames} "
+                        f"available={available} missing={missing} write_pos={write_pos} read_pos={read_pos}\n"
+                    )
+            except Exception:
+                pass
 
     # ---------------------------------------------------------- writer --
 
@@ -183,30 +211,9 @@ class SyncRingBuffer:
 
         if to_copy < n_frames:
             missing = n_frames - to_copy
-            logger.warning(
-                "STUTTER: reader=%s requested=%d available=%d missing=%d write_pos=%d read_pos=%s",
-                reader.name, n_frames, available, missing, current_write, str(read_pos),
-            )
-
             cnt = self._stutter_counters.get(reader.name, 0) + 1
             self._stutter_counters[reader.name] = cnt
-
-            safe_name = (
-                reader.name.replace(' ', '_')
-                .replace('/', '_')
-                .replace('\\', '_')
-                .replace('(', '')
-                .replace(')', '')
-            )
-            log_path = os.path.join(self._stutter_logs_root, f"{safe_name}.log")
-            try:
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(
-                        f"{datetime.utcnow().isoformat()}Z stutter#{cnt} reader={reader.name} requested={n_frames} "
-                        f"available={available} missing={missing} write_pos={current_write} read_pos={read_pos}\n"
-                    )
-            except Exception:
-                logger.exception("Failed to write stutter log for %s", reader.name)
+            self._log_queue.put((reader.name, cnt, n_frames, available, missing, current_write, read_pos))
 
             with reader.lock:
                 reader.underrun_count += 1
@@ -230,9 +237,7 @@ class SyncRingBuffer:
                     reader.adaptive_delay_frames = 0
                     reader._update_target_delay()
                     reader._consecutive_underruns = 0
-            else:
-                rewind = min(bump, read_pos)
-                read_pos = max(0, read_pos - rewind)
+            # Otherwise output silence for the missing frames; no rewind (it replays audio).
 
         if to_copy > 0:
             with self._write_lock:

@@ -49,7 +49,7 @@ class DeviceOutput:
         self._stream = None
         self.output_rate = int(device_info.get("defaultSampleRate", ring_buffer.samplerate))
         self.input_rate = ring_buffer.samplerate
-        self.frames_per_buffer = 512
+        self.frames_per_buffer = 1024
         self._last_callback_ts = 0.0
         self._cb_count = 0
         self._last_frame_count = self.frames_per_buffer
@@ -142,7 +142,7 @@ class DeviceOutput:
         read = consume + 2
         return read, consume
 
-    def _resample(self, frames: np.ndarray, output_frame_count: int) -> np.ndarray:
+    def _resample(self, frames: np.ndarray, output_frame_count: int, phase: float = 0.0) -> np.ndarray:
         if self.input_rate == self.output_rate:
             if frames.shape[0] == output_frame_count:
                 return frames
@@ -159,12 +159,12 @@ class DeviceOutput:
         if src_len == 1:
             return np.repeat(frames, output_frame_count, axis=0)
 
-        target_positions = np.linspace(0, src_len - 1, num=output_frame_count, dtype=np.float32)
-        src_positions = np.arange(src_len, dtype=np.float32)
-        out = np.empty((output_frame_count, frames.shape[1]), dtype=np.float32)
-        for ch in range(frames.shape[1]):
-            out[:, ch] = np.interp(target_positions, src_positions, frames[:, ch])
-        return out
+        # Fixed step that continues from the previous block's fractional phase.
+        ratio = self.input_rate / self.output_rate
+        pos = phase + np.arange(output_frame_count, dtype=np.float64) * ratio
+        i0 = np.minimum(pos.astype(np.int64), src_len - 2)
+        f = np.clip(pos - i0, 0.0, 1.0).astype(np.float32)[:, None]
+        return (frames[i0] * (1.0 - f) + frames[i0 + 1] * f).astype(np.float32, copy=False)
 
     # -------------------------------------------------------------------
 
@@ -226,9 +226,10 @@ class DeviceOutput:
                     return (silence.tobytes(), pyaudio.paAbort)
             # -------------------------------------------------------------
 
+            phase = self._read_frac  # must be captured before _plan_read updates it
             read_frames, consume_frames = self._plan_read(frame_count)
             source = self.ring_buffer.read(self.reader, read_frames, consume=consume_frames)
-            out = self._resample(source, frame_count)
+            out = self._resample(source, frame_count, phase)
             with self.reader.lock:
                 volume = self.reader.volume
             if volume != 1.0:

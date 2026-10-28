@@ -14,8 +14,8 @@ Windows.
 | Common problem | What SyncMirror does instead |
 |---|---|
 | Same audio fired at every device with no sync mechanism -> devices drift out of time | Every device reads from a shared, sample-indexed ring buffer at its own **tunable delay offset** |
-| No drift correction -> devices slip further out of sync over time | Each output cursor is gently nudged (1 sample at a time, inaudible) if it drifts more than ~20ms from its target position |
-| Ad hoc per-device resampling in Python/numpy -> different devices sound tonally different | All outputs use **WASAPI shared mode**, so Windows' own audio engine does the resampling/format conversion consistently for every device |
+| No drift correction -> devices slip further out of sync over time | Each output cursor is nudged back toward its target (up to 10ms per audio callback) if it drifts more than ~20ms from it |
+| Ad hoc per-device resampling in Python/numpy -> different devices sound tonally different | Outputs use **WASAPI shared mode** at each device's native rate. When that differs from the capture rate, a phase-continuous linear resampler in Python converts it, so there are no glitches at block boundaries |
 | Fixed, non-adjustable sync | A per-device delay slider (-500ms to +500ms) lets you dial in perfect sync by ear, per earbud, since each earbud's own Bluetooth latency differs |
 | Static device list; a dropped device stalls everything | The device list **updates live** as devices connect/disconnect, and a dropped device is detected and torn down instantly so it can't stutter the others |
 
@@ -61,7 +61,9 @@ Windows.
 - **Polished desktop UI** — bundled Inter typeface, a live per-device buffer
   meter, an "N · Xm ago" stutter age indicator, and drag tooltips on the
   delay/volume sliders.
-- Per-device stutter logging to `stutter_logs/` for diagnosing sync issues.
+- Per-device stutter logging to `stutter_logs/` for diagnosing sync issues
+  (written from a background thread, never from the audio callback). On an
+  underrun the output goes silent for the missing frames instead of replaying audio.
 
 ## Requirements
 
@@ -121,6 +123,7 @@ full build/packaging reference.
   latency on a specific device.
 - Offload resampling to a per-device worker to further reduce CPU-driven
   stutter under heavy load.
+- Crossfade drift corrections (they currently jump up to 10ms with no crossfade).
 
 ## Files
 
